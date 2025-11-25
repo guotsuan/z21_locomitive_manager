@@ -27,10 +27,42 @@ def export_to_json(z21_file: Z21File, output_path: Path):
             {
                 'address': loco.address,
                 'name': loco.name,
+                'full_name': loco.full_name,
+                'railway': loco.railway,
+                'description': loco.description,
+                'article_number': loco.article_number,
+                'decoder_type': loco.decoder_type,
+                'build_year': loco.build_year,
+                'buffer_length': loco.buffer_length,
+                'model_buffer_length': loco.model_buffer_length,
+                'service_weight': loco.service_weight,
+                'model_weight': loco.model_weight,
+                'rmin': loco.rmin,
+                'ip': loco.ip,
+                'drivers_cab': loco.drivers_cab,
+                'image_name': loco.image_name,
                 'functions': loco.functions,
+                'function_details': {
+                    func_num: {
+                        'function_number': func_info.function_number,
+                        'image_name': func_info.image_name,
+                        'shortcut': func_info.shortcut,
+                        'position': func_info.position,
+                        'time': func_info.time,
+                        'button_type': func_info.button_type,
+                        'is_active': func_info.is_active,
+                    }
+                    for func_num, func_info in loco.function_details.items()
+                },
                 'cvs': loco.cvs,
                 'speed': loco.speed,
                 'direction': loco.direction,
+                'active': loco.active,
+                'speed_display': loco.speed_display,
+                'rail_vehicle_type': loco.rail_vehicle_type,
+                'categories': loco.categories,
+                'crane': loco.crane,
+                'regulation_step': loco.regulation_step,
             }
             for loco in z21_file.locomotives
         ],

@@ -108,9 +108,13 @@ class Z21Parser:
                 z21_file.version = version_row['version']
             
             # Parse locomotives from vehicles table (type=0 means locomotive)
+            # Also include type field to read rail_vehicle_type
             cursor.execute("""
                 SELECT id, name, address, max_speed, active, traction_direction, 
-                       image_name, drivers_cab, description
+                       image_name, drivers_cab, description, full_name, railway,
+                       article_number, decoder_type, build_year, buffer_lenght,
+                       model_buffer_lenght, service_weight, model_weight, rmin, ip,
+                       speed_display, type
                 FROM vehicles 
                 WHERE type = 0
                 ORDER BY position
@@ -126,6 +130,51 @@ class Z21Parser:
                 loco.direction = (vehicle['traction_direction'] or 0) == 1
                 # Store vehicle ID for reliable updates (using a custom attribute)
                 loco._vehicle_id = vehicle['id']  # type: ignore
+                
+                # Extract additional fields
+                loco.image_name = vehicle['image_name'] or ''
+                loco.full_name = vehicle['full_name'] or ''
+                loco.railway = vehicle['railway'] or ''
+                loco.description = vehicle['description'] or ''
+                loco.article_number = vehicle['article_number'] or ''
+                loco.decoder_type = vehicle['decoder_type'] or ''
+                loco.build_year = vehicle['build_year'] or ''
+                loco.buffer_length = vehicle['buffer_lenght'] or ''  # Note: typo in DB column name
+                loco.model_buffer_length = vehicle['model_buffer_lenght'] or ''  # Note: typo in DB column name
+                loco.service_weight = vehicle['service_weight'] or ''
+                loco.model_weight = vehicle['model_weight'] or ''
+                loco.rmin = vehicle['rmin'] or ''
+                loco.ip = vehicle['ip'] or ''
+                loco.drivers_cab = vehicle['drivers_cab'] or ''
+                # sqlite3.Row doesn't support .get(), use direct access with None check
+                loco.active = bool(vehicle['active'] if vehicle['active'] is not None else 1)
+                loco.speed_display = vehicle['speed_display'] if vehicle['speed_display'] is not None else 0
+                loco.rail_vehicle_type = vehicle['type'] if vehicle['type'] is not None else 0
+                
+                # Parse categories for this vehicle
+                cursor.execute("""
+                    SELECT c.name 
+                    FROM categories c
+                    INNER JOIN vehicles_to_categories vtc ON c.id = vtc.category_id
+                    WHERE vtc.vehicle_id = ?
+                """, (vehicle['id'],))
+                category_rows = cursor.fetchall()
+                loco.categories = [row['name'] for row in category_rows if row['name']]
+                
+                # Parse regulation_step from traction_list
+                cursor.execute("""
+                    SELECT regulation_step 
+                    FROM traction_list 
+                    WHERE loco_id = ?
+                    ORDER BY regulation_step
+                    LIMIT 1
+                """, (vehicle['id'],))
+                regulation_row = cursor.fetchone()
+                if regulation_row:
+                    loco.regulation_step = regulation_row['regulation_step'] or 0
+                
+                # Check for crane function (function number 28 is often used for crane)
+                # We'll check this after parsing functions
                 
                 # Parse functions for this vehicle
                 cursor.execute("""
@@ -372,16 +421,35 @@ class Z21Parser:
                         vehicle_id = vehicle_row['id']
                 
                 if vehicle_id:
-                    # Update vehicle fields
+                    # Update vehicle fields including additional fields
                     cursor.execute("""
                         UPDATE vehicles 
-                        SET name = ?, address = ?, max_speed = ?, traction_direction = ?
+                        SET name = ?, address = ?, max_speed = ?, traction_direction = ?,
+                            full_name = ?, railway = ?, article_number = ?, decoder_type = ?,
+                            build_year = ?, model_buffer_lenght = ?, service_weight = ?,
+                            model_weight = ?, rmin = ?, ip = ?, drivers_cab = ?, description = ?,
+                            active = ?, speed_display = ?, type = ?
                         WHERE id = ?
                     """, (
                         loco.name,
                         loco.address,
                         loco.speed,
                         1 if loco.direction else 0,
+                        loco.full_name or None,
+                        loco.railway or None,
+                        loco.article_number or None,
+                        loco.decoder_type or None,
+                        loco.build_year or None,
+                        loco.model_buffer_length or None,  # Note: typo in DB column name
+                        loco.service_weight or None,
+                        loco.model_weight or None,
+                        loco.rmin or None,
+                        loco.ip or None,
+                        loco.drivers_cab or None,
+                        loco.description or None,
+                        1 if loco.active else 0,
+                        loco.speed_display or 0,
+                        loco.rail_vehicle_type or 0,
                         vehicle_id
                     ))
                     # Update stored vehicle ID in case it changed
@@ -449,9 +517,85 @@ class Z21Parser:
                                 func_info.button_type
                             ))
                 else:
-                    # Vehicle not found - might be a new locomotive
-                    # For now, skip (could implement INSERT if needed)
-                    pass
+                    # Vehicle not found - this is a new locomotive, insert it
+                    # Get the maximum position to append at the end
+                    cursor.execute("SELECT MAX(position) as max_pos FROM vehicles WHERE type = 0")
+                    max_pos_row = cursor.fetchone()
+                    next_position = (max_pos_row['max_pos'] or 0) + 1
+                    
+                    # Insert new vehicle
+                    cursor.execute("""
+                        INSERT INTO vehicles 
+                        (type, name, address, max_speed, active, traction_direction,
+                         position, image_name, drivers_cab, description, full_name, railway,
+                         article_number, decoder_type, build_year, buffer_lenght,
+                         model_buffer_lenght, service_weight, model_weight, rmin, ip,
+                         speed_display)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        loco.rail_vehicle_type or 0,
+                        loco.name,
+                        loco.address,
+                        loco.speed,
+                        1 if loco.active else 1,
+                        1 if loco.direction else 0,
+                        next_position,
+                        loco.image_name or None,
+                        loco.drivers_cab or None,
+                        loco.description or None,
+                        loco.full_name or None,
+                        loco.railway or None,
+                        loco.article_number or None,
+                        loco.decoder_type or None,
+                        loco.build_year or None,
+                        loco.buffer_length or None,
+                        loco.model_buffer_length or None,
+                        loco.service_weight or None,
+                        loco.model_weight or None,
+                        loco.rmin or None,
+                        loco.ip or None,
+                        loco.speed_display or 0
+                    ))
+                    
+                    # Get the newly inserted vehicle ID
+                    vehicle_id = cursor.lastrowid
+                    loco._vehicle_id = vehicle_id  # type: ignore
+                    
+                    # Insert categories for new vehicle
+                    if loco.categories:
+                        for category_name in loco.categories:
+                            cursor.execute("SELECT id FROM categories WHERE name = ?", (category_name,))
+                            cat_row = cursor.fetchone()
+                            if cat_row:
+                                cursor.execute("""
+                                    INSERT INTO vehicles_to_categories (vehicle_id, category_id)
+                                    VALUES (?, ?)
+                                """, (vehicle_id, cat_row['id']))
+                    
+                    # Insert regulation_step for new vehicle
+                    if loco.regulation_step:
+                        cursor.execute("""
+                            INSERT INTO traction_list (loco_id, regulation_step, time)
+                            VALUES (?, ?, 0.0)
+                        """, (vehicle_id, loco.regulation_step))
+                    
+                    # Insert functions for the new vehicle
+                    for func_num, func_info in loco.function_details.items():
+                        time_value = float(func_info.time) if func_info.time and func_info.time != "0" else None
+                        cursor.execute("""
+                            INSERT INTO functions 
+                            (vehicle_id, function, position, shortcut, time, 
+                             image_name, button_type, is_configured, show_function_number)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1)
+                        """, (
+                            vehicle_id,
+                            func_num,
+                            func_info.position,
+                            func_info.shortcut or '',
+                            time_value,
+                            func_info.image_name or '',
+                            func_info.button_type
+                        ))
             
             # Commit changes
             db.commit()
