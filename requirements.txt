@@ -1,0 +1,18 @@
+# Python dependencies for Z21 file reader/writer
+
+# Core dependencies
+# struct and pathlib are built-in, no need to install
+
+# Optional: For better CLI experience
+click>=8.0.0
+
+# Optional: For data validation
+# pydantic>=2.0.0
+
+# Optional: For testing
+pytest>=7.0.0
+pytest-cov>=4.0.0
+
+# Optional: For hex dump formatting
+hexdump>=3.3
+
