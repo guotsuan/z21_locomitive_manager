@@ -2095,9 +2095,8 @@ Be accurate and extract all visible functions."""
                                                     func_values.append(
                                                         func_num)
                                                 elif col == 'position':
-                                                    # Z21 exports reset position to 0, so we should do the same
-                                                    # to match Z21 export format (x1_back.z21loco shows position=0)
-                                                    func_values.append(0)
+                                                    # Preserve the position from function_info
+                                                    func_values.append(func_info.position)
                                                 elif col == 'shortcut':
                                                     func_values.append(
                                                         func_info.shortcut
@@ -2237,6 +2236,14 @@ Be accurate and extract all visible functions."""
                         new_db.commit()
                         new_db.close()
                         source_db.close()
+
+                        # Set text encoding to UTF-16le (16) for Z21 APP compatibility
+                        # Text encoding is stored at offset 60-63 (4 bytes, big-endian)
+                        with open(new_db_path, 'rb') as f:
+                            sqlite_data = bytearray(f.read())
+                        sqlite_data[60:64] = (16).to_bytes(4, 'big')
+                        with open(new_db_path, 'wb') as f:
+                            f.write(sqlite_data)
 
                         # Copy locomotive image if exists
                         if self.current_loco.image_name:

@@ -650,7 +650,12 @@ class Z21Parser:
             
             # Read updated database
             with open(tmp_path, 'rb') as f:
-                updated_sqlite_data = f.read()
+                updated_sqlite_data = bytearray(f.read())
+            
+            # Set text encoding to UTF-16le (16) for Z21 APP compatibility
+            # Text encoding is stored at offset 60-63 (4 bytes, big-endian)
+            # We need to set it to 16 (0x00000010)
+            updated_sqlite_data[60:64] = (16).to_bytes(4, 'big')
             
             # Create new ZIP file with updated database
             with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as output_zip:
