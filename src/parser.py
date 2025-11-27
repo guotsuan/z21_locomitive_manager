@@ -427,7 +427,8 @@ class Z21Parser:
                         vehicle_id = None  # Vehicle ID invalid, try other methods
                 
                 # If no vehicle ID, try by current address
-                if not vehicle_id:
+                # But skip this if locomotive is marked as new import (force INSERT)
+                if not vehicle_id and not getattr(loco, '_is_new_import', False):
                     cursor.execute("""
                         SELECT id FROM vehicles 
                         WHERE type = 0 AND address = ?
@@ -437,7 +438,8 @@ class Z21Parser:
                         vehicle_id = vehicle_row['id']
                 
                 # If still not found, try by name (as fallback)
-                if not vehicle_id:
+                # But skip this if locomotive is marked as new import (force INSERT)
+                if not vehicle_id and not getattr(loco, '_is_new_import', False):
                     cursor.execute("""
                         SELECT id FROM vehicles 
                         WHERE type = 0 AND name = ?
@@ -462,7 +464,7 @@ class Z21Parser:
                         'full_name = ?', 'railway = ?', 'article_number = ?', 'decoder_type = ?',
                         'build_year = ?', 'model_buffer_lenght = ?', 'service_weight = ?',
                         'model_weight = ?', 'rmin = ?', 'ip = ?', 'drivers_cab = ?', 'description = ?',
-                        'active = ?', 'speed_display = ?', 'type = ?'
+                        'active = ?', 'speed_display = ?', 'type = ?', 'image_name = ?'
                     ]
                     base_values = [
                         loco.name,
@@ -484,6 +486,7 @@ class Z21Parser:
                         1 if loco.active else 0,
                         loco.speed_display or 0,
                         loco.rail_vehicle_type or 0,
+                        loco.image_name or None,
                     ]
                     
                     # Add in_stock_since if field exists
@@ -607,6 +610,9 @@ class Z21Parser:
                     # Get the newly inserted vehicle ID
                     vehicle_id = cursor.lastrowid
                     loco._vehicle_id = vehicle_id  # type: ignore
+                    # Clear new import flag after successful insert
+                    if hasattr(loco, '_is_new_import'):
+                        loco._is_new_import = False  # type: ignore
                     
                     # Insert categories for new vehicle
                     if loco.categories:
@@ -644,6 +650,38 @@ class Z21Parser:
                             func_info.button_type
                         ))
             
+            # Delete locomotives that are no longer in z21_file.locomotives
+            # First, collect all vehicle IDs that should be kept
+            kept_vehicle_ids = set()
+            for loco in z21_file.locomotives:
+                if hasattr(loco, '_vehicle_id') and loco._vehicle_id:
+                    kept_vehicle_ids.add(loco._vehicle_id)
+                else:
+                    # Try to find by address or name
+                    cursor.execute("""
+                        SELECT id FROM vehicles 
+                        WHERE type = 0 AND (address = ? OR name = ?)
+                    """, (loco.address, loco.name))
+                    row = cursor.fetchone()
+                    if row:
+                        kept_vehicle_ids.add(row['id'])
+            
+            # Find all vehicles in database (type = 0)
+            cursor.execute("SELECT id FROM vehicles WHERE type = 0")
+            all_vehicle_ids = {row['id'] for row in cursor.fetchall()}
+            
+            # Delete vehicles that are not in the kept list
+            vehicles_to_delete = all_vehicle_ids - kept_vehicle_ids
+            for vehicle_id in vehicles_to_delete:
+                # Delete associated functions
+                cursor.execute("DELETE FROM functions WHERE vehicle_id = ?", (vehicle_id,))
+                # Delete associated categories
+                cursor.execute("DELETE FROM vehicles_to_categories WHERE vehicle_id = ?", (vehicle_id,))
+                # Delete associated traction_list entries
+                cursor.execute("DELETE FROM traction_list WHERE loco_id = ?", (vehicle_id,))
+                # Delete the vehicle itself
+                cursor.execute("DELETE FROM vehicles WHERE id = ?", (vehicle_id,))
+            
             # Commit changes
             db.commit()
             db.close()
@@ -657,9 +695,20 @@ class Z21Parser:
             # We need to set it to 16 (0x00000010)
             updated_sqlite_data[60:64] = (16).to_bytes(4, 'big')
             
+            # Collect all image files that are still in use
+            used_image_files = set()
+            for loco in z21_file.locomotives:
+                # Add locomotive image if exists
+                if loco.image_name:
+                    used_image_files.add(loco.image_name)
+                # Add function images if exist
+                for func_info in loco.function_details.values():
+                    if func_info.image_name:
+                        used_image_files.add(func_info.image_name)
+            
             # Create new ZIP file with updated database
             with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as output_zip:
-                # Copy all files from original ZIP, replacing SQLite file
+                # Copy files from original ZIP, replacing SQLite file and removing unused images
                 for item in input_zip.infolist():
                     if item.filename == sqlite_path:
                         # Write updated SQLite file with preserved metadata
@@ -671,15 +720,43 @@ class Z21Parser:
                         zip_info.external_attr = item.external_attr
                         output_zip.writestr(zip_info, updated_sqlite_data)
                     else:
-                        # Copy other files as-is with preserved metadata
-                        data = input_zip.read(item.filename)
-                        zip_info = zipfile.ZipInfo(
-                            filename=item.filename,
-                            date_time=item.date_time
-                        )
-                        zip_info.compress_type = item.compress_type
-                        zip_info.external_attr = item.external_attr
-                        output_zip.writestr(zip_info, data)
+                        # Check if this is an image file
+                        is_image = item.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff'))
+                        if is_image:
+                            # Only copy if image is still in use
+                            # Check if filename matches any used image (handle path variations)
+                            filename_only = Path(item.filename).name
+                            # Check exact match or if used image name is contained in filename
+                            # Priority: exact filename match > path ends with image name > image name in path
+                            is_used = False
+                            for used_img in used_image_files:
+                                if (filename_only == used_img or 
+                                    item.filename == used_img or
+                                    item.filename.endswith(used_img) or
+                                    used_img in item.filename):
+                                    is_used = True
+                                    break
+                            
+                            if is_used:
+                                data = input_zip.read(item.filename)
+                                zip_info = zipfile.ZipInfo(
+                                    filename=item.filename,
+                                    date_time=item.date_time
+                                )
+                                zip_info.compress_type = item.compress_type
+                                zip_info.external_attr = item.external_attr
+                                output_zip.writestr(zip_info, data)
+                            # Otherwise, skip this unused image file
+                        else:
+                            # Copy other non-image files as-is with preserved metadata
+                            data = input_zip.read(item.filename)
+                            zip_info = zipfile.ZipInfo(
+                                filename=item.filename,
+                                date_time=item.date_time
+                            )
+                            zip_info.compress_type = item.compress_type
+                            zip_info.external_attr = item.external_attr
+                            output_zip.writestr(zip_info, data)
             
             return output_path
             

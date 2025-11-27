@@ -57,9 +57,31 @@ class Z21GUI:
             __file__).parent.parent / "icons" / "neutrals_normal.png"
         self.icon_cache = {}  # Cache for loaded icons
         self.icon_mapping = self.load_icon_mapping()  # Load icon mapping
+        self.status_timeout_id = None  # Store timeout ID for status message clearing
+        self.default_status_text = "Loading..."  # Default status text
 
         self.setup_ui()
         self.load_data()
+
+    def set_status_message(self, message: str, timeout: int = 5000):
+        """Set status bar message and clear it after timeout (default 5 seconds).
+        
+        Args:
+            message: Message to display
+            timeout: Timeout in milliseconds (default 5000ms = 5 seconds)
+        """
+        # Cancel any existing timeout
+        if self.status_timeout_id is not None:
+            self.root.after_cancel(self.status_timeout_id)
+            self.status_timeout_id = None
+
+        # Set the message
+        self.status_label.config(text=message)
+
+        # Schedule clearing the message after timeout
+        self.status_timeout_id = self.root.after(
+            timeout,
+            lambda: self.status_label.config(text=self.default_status_text))
 
     def load_icon_mapping(self):
         """Load icon mapping from JSON file."""
@@ -72,6 +94,33 @@ class Z21GUI:
             except Exception:
                 return {}
         return {}
+
+    def set_status_message(self, message: str, timeout: int = 5000):
+        """Set status message and clear it after timeout (default 5 seconds).
+        
+        Args:
+            message: Status message to display
+            timeout: Timeout in milliseconds (default 5000ms = 5 seconds)
+        """
+        # Cancel any existing timeout
+        if self.status_timeout_id is not None:
+            self.root.after_cancel(self.status_timeout_id)
+            self.status_timeout_id = None
+
+        # Set the message
+        self.status_label.config(text=message)
+
+        # Schedule clearing the message after timeout
+        self.status_timeout_id = self.root.after(
+            timeout,
+            lambda: self.status_label.config(text=self.default_status_text))
+
+    def update_status_count(self):
+        """Update the default status text with current locomotive count."""
+        if self.z21_data:
+            self.default_status_text = f"Loaded {len(self.z21_data.locomotives)} locomotives"
+        else:
+            self.default_status_text = "No data loaded"
 
     def setup_ui(self):
         """Set up the user interface."""
@@ -109,11 +158,21 @@ class Z21GUI:
                                  width=20)
         search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
 
+        # Button container for New and Delete buttons (vertical layout)
+        button_frame = ttk.Frame(search_frame)
+        button_frame.pack(side=tk.LEFT, padx=5)
+
         # New button to create a new locomotive
-        new_button = ttk.Button(search_frame,
+        new_button = ttk.Button(button_frame,
                                 text="New",
                                 command=self.create_new_locomotive)
-        new_button.pack(side=tk.LEFT, padx=5)
+        new_button.pack(side=tk.TOP, padx=0, pady=(0, 2))
+
+        # Delete button to delete selected locomotive
+        delete_button = ttk.Button(button_frame,
+                                   text="Delete",
+                                   command=self.delete_selected_locomotive)
+        delete_button.pack(side=tk.TOP, padx=0, pady=0)
 
         # Locomotive list
         list_frame = ttk.Frame(left_frame)
@@ -215,6 +274,10 @@ class Z21GUI:
                                    pady=5,
                                    sticky='ew')
         self.loco_image_label.image = None  # Keep a reference to prevent garbage collection
+        # Add click event to open image upload/crop window
+        self.loco_image_label.bind('<Button-1>', self.on_image_click)
+        self.loco_image_label.config(
+            cursor='hand2')  # Show hand cursor on hover
 
         # Row 1: Name and Address (two columns)
         ttk.Label(details_frame, text="Name:", width=10,
@@ -634,11 +697,16 @@ class Z21GUI:
                                         text="Export Z21 Loco",
                                         command=self.export_z21_loco)
         self.export_button.pack(side=tk.LEFT, padx=5)
-        
+
         self.share_button = ttk.Button(button_frame,
                                        text="Share with WIFI",
                                        command=self.share_with_airdrop)
         self.share_button.pack(side=tk.LEFT, padx=5)
+
+        self.import_button = ttk.Button(button_frame,
+                                        text="Import Loco",
+                                        command=self.import_z21_loco)
+        self.import_button.pack(side=tk.LEFT, padx=5)
 
         self.scan_button = ttk.Button(button_frame,
                                       text="Scan for Details",
@@ -902,29 +970,63 @@ class Z21GUI:
             self.parser = Z21Parser(self.z21_file)
             self.z21_data = self.parser.parse()
 
+            # populate_list will automatically select the first locomotive
             self.populate_list()
-            self.status_label.config(
-                text=f"Loaded {len(self.z21_data.locomotives)} locomotives")
+            self.update_status_count()
+            self.status_label.config(text=self.default_status_text)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load file:\n{e}")
-            self.status_label.config(text="Error loading file")
+            self.set_status_message("Error loading file")
+
+    def normalize_for_search(self, text: str) -> str:
+        """Normalize text for fuzzy matching by removing spaces and other non-important characters."""
+        if not text:
+            return ""
+        # Convert to lowercase and remove all whitespace and common punctuation
+        normalized = text.lower()
+        # Remove spaces, tabs, and other whitespace
+        normalized = ''.join(normalized.split())
+        # Remove common punctuation that might be used inconsistently
+        normalized = normalized.replace('-', '').replace('_',
+                                                         '').replace('.', '')
+        return normalized
 
     def populate_list(self, filter_text: str = ""):
-        """Populate the locomotive list."""
+        """Populate the locomotive list with fuzzy matching."""
         if not self.z21_data:
             return
 
         self.loco_listbox.delete(0, tk.END)
         self.filtered_locos = []
 
-        filter_lower = filter_text.lower()
+        # Normalize filter text for fuzzy matching
+        filter_normalized = self.normalize_for_search(filter_text)
 
         for loco in self.z21_data.locomotives:
             display_text = f"Address {loco.address:4d} - {loco.name}"
 
-            if not filter_text or filter_lower in display_text.lower():
+            # Normalize both the display text and address for matching
+            display_normalized = self.normalize_for_search(display_text)
+            address_normalized = self.normalize_for_search(str(loco.address))
+            name_normalized = self.normalize_for_search(loco.name)
+
+            # Check if filter matches (empty filter shows all)
+            if not filter_text:
                 self.loco_listbox.insert(tk.END, display_text)
                 self.filtered_locos.append(loco)
+            elif (filter_normalized in display_normalized
+                  or filter_normalized in address_normalized
+                  or filter_normalized in name_normalized):
+                self.loco_listbox.insert(tk.END, display_text)
+                self.filtered_locos.append(loco)
+
+        # Select first matching locomotive if available
+        if self.filtered_locos:
+            self.loco_listbox.selection_clear(0, tk.END)
+            self.loco_listbox.selection_set(0)
+            self.loco_listbox.see(0)
+            # Trigger selection event to update details
+            self.on_loco_select(None)
 
     def on_search(self, *args):
         """Handle search text change."""
@@ -935,7 +1037,12 @@ class Z21GUI:
         """Handle locomotive selection."""
         selection = self.loco_listbox.curselection()
         if not selection:
-            return
+            # If no selection but we have filtered locos, try to select first
+            if self.filtered_locos:
+                self.loco_listbox.selection_set(0)
+                selection = (0, )
+            else:
+                return
 
         index = selection[0]
         if index < len(self.filtered_locos):
@@ -1006,10 +1113,371 @@ class Z21GUI:
         # Focus on name field for easy editing
         self.root.after(100, lambda: self.name_entry.focus())
 
+        # Update status bar with new locomotive count
+        self.update_status_count()
+
         messagebox.showinfo(
             "New Locomotive",
             f"Created new locomotive with address {new_address}.\n"
             f"You can now edit the details.")
+
+    def delete_selected_locomotive(self):
+        """Delete the currently selected locomotive."""
+        if not self.current_loco or not self.z21_data:
+            self.set_status_message("No locomotive selected.")
+            return
+
+        # Confirm deletion
+        loco_display = f"Address {self.current_loco.address:4d} - {self.current_loco.name}"
+        if not messagebox.askyesno(
+                "Confirm Delete",
+                f"Are you sure you want to delete locomotive:\n{loco_display}?\n\n"
+                f"This action cannot be undone."):
+            return
+
+        try:
+            # Find and remove the locomotive from z21_data
+            if self.current_loco_index is not None and self.current_loco_index < len(
+                    self.z21_data.locomotives):
+                deleted_loco = self.z21_data.locomotives.pop(
+                    self.current_loco_index)
+
+                # Clear current selection
+                self.current_loco = None
+                self.current_loco_index = None
+                self.original_loco_address = None
+
+                # Clear the details display
+                self.update_details()
+
+                # Update the list
+                self.populate_list(self.search_var.get(
+                ) if hasattr(self, 'search_var') else "")
+
+                # Save changes to file
+                try:
+                    self.parser.write(self.z21_data, self.z21_file)
+                    # Update status bar with new locomotive count
+                    self.update_status_count()
+                    # Show success message in status bar
+                    self.set_status_message(
+                        f"Locomotive '{deleted_loco.name}' (Address {deleted_loco.address}) deleted and saved successfully."
+                    )
+                except Exception as save_error:
+                    # Update status bar with new locomotive count even if save failed
+                    self.update_status_count()
+                    # Show error if save failed
+                    self.set_status_message(
+                        f"Locomotive deleted from memory but failed to save to file: {save_error}"
+                    )
+                    messagebox.showerror(
+                        "Save Error",
+                        f"Failed to save changes to file:\n{save_error}\n\n"
+                        f"The locomotive has been removed from memory but the file was not updated."
+                    )
+            else:
+                self.set_status_message(
+                    "Error: Could not find locomotive in data structure.")
+        except Exception as e:
+            self.set_status_message(f"Failed to delete locomotive: {e}")
+
+    def on_image_click(self, event):
+        """Handle click on locomotive image to upload and crop new image."""
+        if not self.current_loco:
+            self.set_status_message("No locomotive selected.")
+            return
+
+        # Open file dialog to select image
+        file_path = filedialog.askopenfilename(
+            title="Select Locomotive Image",
+            filetypes=[("Image files",
+                        "*.png *.jpg *.jpeg *.gif *.bmp *.tiff"),
+                       ("All files", "*.*")])
+
+        if not file_path:
+            return  # User cancelled
+
+        # Open image crop window
+        self.open_image_crop_window(file_path)
+
+    def open_image_crop_window(self, image_path: str):
+        """Open a window to crop the uploaded image."""
+        if not HAS_PIL:
+            messagebox.showerror(
+                "Error", "PIL/Pillow is required for image processing.")
+            return
+
+        try:
+            # Load the image
+            original_image = Image.open(image_path)
+            img_width, img_height = original_image.size
+
+            # Create crop window
+            crop_window = tk.Toplevel(self.root)
+            crop_window.title("Crop Locomotive Image")
+            crop_window.transient(self.root)
+            crop_window.grab_set()
+
+            # Set window size (show image with some padding)
+            display_width = min(800, img_width)
+            display_height = min(600, img_height)
+            crop_window.geometry(
+                f"{display_width + 100}x{display_height + 150}")
+
+            # Create canvas for image display
+            canvas_frame = ttk.Frame(crop_window, padding=10)
+            canvas_frame.pack(fill=tk.BOTH, expand=True)
+
+            canvas = tk.Canvas(canvas_frame, bg='gray90', highlightthickness=1)
+            canvas.pack(fill=tk.BOTH, expand=True)
+
+            # Calculate scale to fit image in canvas
+            scale_x = display_width / img_width
+            scale_y = display_height / img_height
+            scale = min(scale_x, scale_y, 1.0)  # Don't scale up
+
+            display_img_width = int(img_width * scale)
+            display_img_height = int(img_height * scale)
+
+            # Convert PIL image to PhotoImage for display
+            display_image = original_image.resize(
+                (display_img_width, display_img_height), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(display_image)
+            canvas.create_image(0, 0, anchor=tk.NW, image=photo)
+            canvas.image = photo  # Keep reference
+
+            # Set canvas size
+            canvas.config(scrollregion=canvas.bbox("all"),
+                          width=display_img_width,
+                          height=display_img_height)
+
+            # Crop rectangle coordinates (in display coordinates)
+            crop_rect = {
+                'x1': 0,
+                'y1': 0,
+                'x2': display_img_width,
+                'y2': display_img_height
+            }
+
+            # Draw initial crop rectangle
+            rect_id = canvas.create_rectangle(crop_rect['x1'],
+                                              crop_rect['y1'],
+                                              crop_rect['x2'],
+                                              crop_rect['y2'],
+                                              outline='red',
+                                              width=2,
+                                              tags='crop_rect')
+
+            # Variables for dragging
+            drag_data = {'x': 0, 'y': 0, 'item': None, 'corner': None}
+
+            def get_corner(x, y):
+                """Determine which corner or edge is being dragged."""
+                margin = 10
+                x1, y1, x2, y2 = crop_rect['x1'], crop_rect['y1'], crop_rect[
+                    'x2'], crop_rect['y2']
+
+                # Check corners
+                if abs(x - x1) < margin and abs(y - y1) < margin:
+                    return 'nw'
+                elif abs(x - x2) < margin and abs(y - y1) < margin:
+                    return 'ne'
+                elif abs(x - x1) < margin and abs(y - y2) < margin:
+                    return 'sw'
+                elif abs(x - x2) < margin and abs(y - y2) < margin:
+                    return 'se'
+                # Check edges
+                elif abs(x - x1) < margin:
+                    return 'w'
+                elif abs(x - x2) < margin:
+                    return 'e'
+                elif abs(y - y1) < margin:
+                    return 'n'
+                elif abs(y - y2) < margin:
+                    return 's'
+                # Check if inside rectangle
+                elif x1 <= x <= x2 and y1 <= y <= y2:
+                    return 'move'
+                return None
+
+            def on_canvas_press(event):
+                """Handle mouse press on canvas."""
+                x, y = event.x, event.y
+                corner = get_corner(x, y)
+                if corner:
+                    drag_data['x'] = x
+                    drag_data['y'] = y
+                    drag_data['corner'] = corner
+                    drag_data['item'] = rect_id
+
+            def on_canvas_drag(event):
+                """Handle mouse drag on canvas."""
+                if drag_data['item'] is None:
+                    return
+
+                dx = event.x - drag_data['x']
+                dy = event.y - drag_data['y']
+                corner = drag_data['corner']
+
+                x1, y1, x2, y2 = crop_rect['x1'], crop_rect['y1'], crop_rect[
+                    'x2'], crop_rect['y2']
+
+                if corner == 'move':
+                    # Move entire rectangle
+                    new_x1 = max(0, min(x1 + dx,
+                                        display_img_width - (x2 - x1)))
+                    new_y1 = max(0, min(y1 + dy,
+                                        display_img_height - (y2 - y1)))
+                    new_x2 = new_x1 + (x2 - x1)
+                    new_y2 = new_y1 + (y2 - y1)
+
+                    if new_x2 <= display_img_width and new_y2 <= display_img_height:
+                        crop_rect['x1'] = new_x1
+                        crop_rect['y1'] = new_y1
+                        crop_rect['x2'] = new_x2
+                        crop_rect['y2'] = new_y2
+                elif corner == 'nw':
+                    crop_rect['x1'] = max(0, min(x1 + dx, x2 - 10))
+                    crop_rect['y1'] = max(0, min(y1 + dy, y2 - 10))
+                elif corner == 'ne':
+                    crop_rect['x2'] = min(display_img_width,
+                                          max(x2 + dx, x1 + 10))
+                    crop_rect['y1'] = max(0, min(y1 + dy, y2 - 10))
+                elif corner == 'sw':
+                    crop_rect['x1'] = max(0, min(x1 + dx, x2 - 10))
+                    crop_rect['y2'] = min(display_img_height,
+                                          max(y2 + dy, y1 + 10))
+                elif corner == 'se':
+                    crop_rect['x2'] = min(display_img_width,
+                                          max(x2 + dx, x1 + 10))
+                    crop_rect['y2'] = min(display_img_height,
+                                          max(y2 + dy, y1 + 10))
+                elif corner == 'n':
+                    crop_rect['y1'] = max(0, min(y1 + dy, y2 - 10))
+                elif corner == 's':
+                    crop_rect['y2'] = min(display_img_height,
+                                          max(y2 + dy, y1 + 10))
+                elif corner == 'w':
+                    crop_rect['x1'] = max(0, min(x1 + dx, x2 - 10))
+                elif corner == 'e':
+                    crop_rect['x2'] = min(display_img_width,
+                                          max(x2 + dx, x1 + 10))
+
+                # Update rectangle
+                canvas.coords(rect_id, crop_rect['x1'], crop_rect['y1'],
+                              crop_rect['x2'], crop_rect['y2'])
+                drag_data['x'] = event.x
+                drag_data['y'] = event.y
+
+            def on_canvas_release(event):
+                """Handle mouse release on canvas."""
+                drag_data['item'] = None
+                drag_data['corner'] = None
+
+            # Bind mouse events
+            canvas.bind('<Button-1>', on_canvas_press)
+            canvas.bind('<B1-Motion>', on_canvas_drag)
+            canvas.bind('<ButtonRelease-1>', on_canvas_release)
+
+            # Buttons frame
+            button_frame = ttk.Frame(crop_window, padding=10)
+            button_frame.pack(fill=tk.X)
+
+            def save_cropped_image():
+                """Save the cropped image and update locomotive."""
+                try:
+                    # Convert display coordinates back to original image coordinates
+                    orig_x1 = int(crop_rect['x1'] / scale)
+                    orig_y1 = int(crop_rect['y1'] / scale)
+                    orig_x2 = int(crop_rect['x2'] / scale)
+                    orig_y2 = int(crop_rect['y2'] / scale)
+
+                    # Ensure coordinates are within image bounds
+                    orig_x1 = max(0, min(orig_x1, img_width))
+                    orig_y1 = max(0, min(orig_y1, img_height))
+                    orig_x2 = max(orig_x1 + 1, min(orig_x2, img_width))
+                    orig_y2 = max(orig_y1 + 1, min(orig_y2, img_height))
+
+                    # Crop the image
+                    cropped_image = original_image.crop(
+                        (orig_x1, orig_y1, orig_x2, orig_y2))
+
+                    # Generate new image filename (UUID-based)
+                    import uuid
+                    new_image_name = f"{uuid.uuid4().hex.upper()}.png"
+
+                    # Save image to temporary file first
+                    with tempfile.NamedTemporaryFile(
+                            delete=False, suffix='.png') as tmp_file:
+                        cropped_image.save(tmp_file.name, 'PNG')
+                        tmp_path = Path(tmp_file.name)
+
+                    # Store old image name before updating
+                    old_image_name = self.current_loco.image_name if self.current_loco.image_name else None
+
+                    # Update locomotive image name FIRST (before saving)
+                    # This ensures parser.write will recognize the new image as "in use"
+                    self.current_loco.image_name = new_image_name
+
+                    # Update locomotive in z21_data
+                    if self.current_loco_index is not None:
+                        self.z21_data.locomotives[
+                            self.current_loco_index] = self.current_loco
+
+                    # Save changes - this will:
+                    # 1. Update database with new image_name
+                    # 2. Copy new image from temp file to ZIP
+                    # 3. Remove old unused images
+                    # We need to pass the new image data to parser.write
+                    # Since parser.write reads from input_zip, we need to add the new image first
+                    # But actually, parser.write will create a new ZIP, so we can add the new image there
+
+                    # Save changes - parser.write will:
+                    # - Read the ZIP (which may not contain the new image yet)
+                    # - Update the database with new image_name
+                    # - Copy used images from original ZIP
+                    # - We need to ensure the new image is included
+                    self.parser.write(self.z21_data, self.z21_file)
+
+                    # After parser.write creates the new ZIP, add the new image if it's not already there
+                    # This ensures the new image is in the final ZIP file
+                    with zipfile.ZipFile(self.z21_file, 'a') as zf:
+                        if new_image_name not in zf.namelist():
+                            zf.write(tmp_path, new_image_name)
+
+                    # Clean up temp file
+                    tmp_path.unlink()
+
+                    # Update display
+                    self.update_details()
+
+                    # Close crop window
+                    crop_window.destroy()
+
+                    # Show success message
+                    self.set_status_message(
+                        "Locomotive image updated successfully!")
+
+                except Exception as e:
+                    messagebox.showerror("Error",
+                                         f"Failed to save cropped image: {e}")
+
+            ttk.Button(button_frame,
+                       text="Cancel",
+                       command=crop_window.destroy).pack(side=tk.RIGHT, padx=5)
+            ttk.Button(button_frame, text="Save",
+                       command=save_cropped_image).pack(side=tk.RIGHT, padx=5)
+
+            # Instructions label
+            instructions = ttk.Label(
+                button_frame,
+                text=
+                "Drag corners/edges to resize, drag inside to move the crop area",
+                font=('Arial', 9))
+            instructions.pack(side=tk.LEFT, padx=5)
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open image: {e}")
 
     def update_details(self):
         """Update the details display."""
@@ -1071,13 +1539,17 @@ class Z21GUI:
             loco_image = self.load_locomotive_image(loco.image_name,
                                                     size=(227, 94))
             if loco_image:
+                # Clear text and set image - don't set compound when showing image only
                 self.loco_image_label.config(image=loco_image, text='')
                 self.loco_image_label.image = loco_image  # Keep a reference
             else:
+                # Show text only when image fails to load
+                # Make sure to clear any existing image reference
+                self.loco_image_label.image = None
                 self.loco_image_label.config(image='',
                                              text=f'Image:\n{loco.image_name}')
-                self.loco_image_label.image = None
         else:
+            # No image name
             self.loco_image_label.config(image='', text='No Image')
             self.loco_image_label.image = None
 
@@ -1914,14 +2386,13 @@ Be accurate and extract all visible functions."""
             # Write changes back to file
             try:
                 self.parser.write(self.z21_data, self.z21_file)
-                messagebox.showinfo(
-                    "Success",
+                # Show success message in status bar instead of messagebox
+                self.set_status_message(
                     "Locomotive details saved successfully to file!")
             except Exception as write_error:
-                messagebox.showerror(
-                    "Write Error",
-                    f"Failed to write changes to file: {write_error}\n\n"
-                    f"Changes have been saved in memory but not written to disk."
+                # Show error in status bar
+                self.set_status_message(
+                    f"Failed to write changes to file: {write_error}. Changes saved in memory but not written to disk."
                 )
 
             # Update the listbox to reflect name change
@@ -1929,12 +2400,13 @@ Be accurate and extract all visible functions."""
                 self.search_var.get() if hasattr(self, 'search_var') else "")
 
         except ValueError as e:
-            messagebox.showerror(
-                "Error",
-                f"Invalid input: {e}\n\nPlease enter valid numbers for Address and Max Speed."
+            # Show validation error in status bar
+            self.set_status_message(
+                f"Invalid input: {e}. Please enter valid numbers for Address and Max Speed."
             )
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to save changes: {e}")
+            # Show error in status bar
+            self.set_status_message(f"Failed to save changes: {e}")
 
     def export_z21_loco(self):
         """Export current locomotive to z21_loco.z21loco format."""
@@ -2040,6 +2512,195 @@ Be accurate and extract all visible functions."""
                             if row:
                                 vehicle_id = row['id']
 
+                        # If vehicle_id still not found, this is a new locomotive
+                        # We need to create it in the new database
+                        if not vehicle_id:
+                            # This is a new locomotive that hasn't been saved yet
+                            # Create it in the new database
+                            print(
+                                f"Warning: Vehicle ID not found for locomotive {self.current_loco.name} (address {self.current_loco.address}). Creating new vehicle in export database."
+                            )
+
+                            # Get the maximum position to append at the end
+                            new_cursor.execute(
+                                "SELECT MAX(position) as max_pos FROM vehicles WHERE type = 0"
+                            )
+                            max_pos_row = new_cursor.fetchone()
+                            next_position = (max_pos_row[0] if max_pos_row
+                                             and max_pos_row[0] is not None
+                                             else 0) + 1
+
+                            # Get vehicle table structure from source
+                            source_cursor.execute(
+                                "PRAGMA table_info(vehicles)")
+                            vehicle_columns_info = source_cursor.fetchall()
+                            vehicle_column_names = [
+                                col[1] for col in vehicle_columns_info
+                            ]
+
+                            # Build INSERT statement for new vehicle
+                            # Get default values from a sample vehicle in source database
+                            source_cursor.execute(
+                                "SELECT * FROM vehicles WHERE type = 0 LIMIT 1"
+                            )
+                            sample_vehicle = source_cursor.fetchone()
+
+                            if sample_vehicle:
+                                # Create new vehicle with current locomotive data
+                                insert_columns = []
+                                insert_values = []
+
+                                for col_name in vehicle_column_names:
+                                    if col_name == 'id':
+                                        continue  # Skip id, will be auto-generated
+                                    elif col_name == 'type':
+                                        insert_columns.append(col_name)
+                                        insert_values.append(
+                                            getattr(self.current_loco,
+                                                    'rail_vehicle_type', 0)
+                                            or 0)
+                                    elif col_name == 'name':
+                                        insert_columns.append(col_name)
+                                        insert_values.append(
+                                            self.current_loco.name or '')
+                                    elif col_name == 'address':
+                                        insert_columns.append(col_name)
+                                        insert_values.append(
+                                            self.current_loco.address or 0)
+                                    elif col_name == 'max_speed':
+                                        insert_columns.append(col_name)
+                                        insert_values.append(
+                                            self.current_loco.speed or 0)
+                                    elif col_name == 'active':
+                                        insert_columns.append(col_name)
+                                        insert_values.append(1 if getattr(
+                                            self.current_loco, 'active', True
+                                        ) else 0)
+                                    elif col_name == 'traction_direction':
+                                        insert_columns.append(col_name)
+                                        insert_values.append(
+                                            1 if self.current_loco.
+                                            direction else 0)
+                                    elif col_name == 'position':
+                                        insert_columns.append(col_name)
+                                        insert_values.append(next_position)
+                                    elif col_name == 'image_name':
+                                        insert_columns.append(col_name)
+                                        insert_values.append(
+                                            self.current_loco.image_name
+                                            or None)
+                                    elif col_name == 'full_name':
+                                        insert_columns.append(col_name)
+                                        insert_values.append(
+                                            getattr(self.current_loco,
+                                                    'full_name', '') or None)
+                                    elif col_name == 'railway':
+                                        insert_columns.append(col_name)
+                                        insert_values.append(
+                                            getattr(self.current_loco,
+                                                    'railway', '') or None)
+                                    elif col_name == 'description':
+                                        insert_columns.append(col_name)
+                                        insert_values.append(
+                                            getattr(self.current_loco,
+                                                    'description', '') or None)
+                                    elif col_name == 'article_number':
+                                        insert_columns.append(col_name)
+                                        insert_values.append(
+                                            getattr(self.current_loco,
+                                                    'article_number', '')
+                                            or None)
+                                    elif col_name == 'decoder_type':
+                                        insert_columns.append(col_name)
+                                        insert_values.append(
+                                            getattr(self.current_loco,
+                                                    'decoder_type', '')
+                                            or None)
+                                    elif col_name == 'build_year':
+                                        insert_columns.append(col_name)
+                                        insert_values.append(
+                                            getattr(self.current_loco,
+                                                    'build_year', '') or None)
+                                    elif col_name == 'buffer_lenght':
+                                        insert_columns.append(col_name)
+                                        insert_values.append(
+                                            getattr(self.current_loco,
+                                                    'buffer_length', '')
+                                            or None)
+                                    elif col_name == 'model_buffer_lenght':
+                                        insert_columns.append(col_name)
+                                        insert_values.append(
+                                            getattr(self.current_loco,
+                                                    'model_buffer_length', '')
+                                            or None)
+                                    elif col_name == 'service_weight':
+                                        insert_columns.append(col_name)
+                                        insert_values.append(
+                                            getattr(self.current_loco,
+                                                    'service_weight', '')
+                                            or None)
+                                    elif col_name == 'model_weight':
+                                        insert_columns.append(col_name)
+                                        insert_values.append(
+                                            getattr(self.current_loco,
+                                                    'model_weight', '')
+                                            or None)
+                                    elif col_name == 'rmin':
+                                        insert_columns.append(col_name)
+                                        insert_values.append(
+                                            getattr(self.current_loco, 'rmin',
+                                                    '') or None)
+                                    elif col_name == 'ip':
+                                        insert_columns.append(col_name)
+                                        insert_values.append(
+                                            getattr(self.current_loco, 'ip',
+                                                    '') or None)
+                                    elif col_name == 'speed_display':
+                                        insert_columns.append(col_name)
+                                        insert_values.append(
+                                            getattr(self.current_loco,
+                                                    'speed_display', 0) or 0)
+                                    elif col_name == 'drivers_cab':
+                                        insert_columns.append(col_name)
+                                        insert_values.append(
+                                            getattr(self.current_loco,
+                                                    'drivers_cab', '') or None)
+                                    elif col_name in [
+                                            'in_stock_since', 'inStockSince',
+                                            'in_stock_since_date'
+                                    ]:
+                                        insert_columns.append(col_name)
+                                        insert_values.append(
+                                            getattr(self.current_loco,
+                                                    'in_stock_since', '')
+                                            or None)
+                                    else:
+                                        # Use default value from sample or None
+                                        if col_name in sample_vehicle.keys():
+                                            insert_columns.append(col_name)
+                                            insert_values.append(
+                                                sample_vehicle[col_name])
+
+                                # Insert new vehicle
+                                placeholders = ', '.join(
+                                    ['?' for _ in insert_columns])
+                                columns_str = ', '.join(insert_columns)
+                                new_cursor.execute(
+                                    f"INSERT INTO vehicles ({columns_str}) VALUES ({placeholders})",
+                                    tuple(insert_values))
+
+                                # Get the newly inserted vehicle ID
+                                vehicle_id = new_cursor.lastrowid
+                                print(
+                                    f"Created new vehicle in export database with ID: {vehicle_id}"
+                                )
+                            else:
+                                messagebox.showerror(
+                                    "Error",
+                                    "Cannot create new vehicle: no sample vehicle found in source database."
+                                )
+                                return
+
                         if vehicle_id:
                             # Copy vehicle data
                             source_cursor.execute(
@@ -2112,7 +2773,8 @@ Be accurate and extract all visible functions."""
                                                         func_num)
                                                 elif col == 'position':
                                                     # Preserve the position from function_info
-                                                    func_values.append(func_info.position)
+                                                    func_values.append(
+                                                        func_info.position)
                                                 elif col == 'shortcut':
                                                     func_values.append(
                                                         func_info.shortcut
@@ -2320,31 +2982,30 @@ Be accurate and extract all visible functions."""
 
         # Check if PyObjC is available (macOS only)
         if platform.system() != 'Darwin':
-            messagebox.showerror("Error",
-                                 "AirDrop sharing is only available on macOS.")
+            messagebox.showerror(
+                "Error", "AirDrop sharing is only available on macOS.")
             return
 
         if not HAS_PYOBJC:
             messagebox.showerror(
-                "Error",
-                "PyObjC is required for AirDrop sharing.\n\n"
+                "Error", "PyObjC is required for AirDrop sharing.\n\n"
                 "Please install it with:\n"
-                "pip install pyobjc-framework-AppKit"
-            )
+                "pip install pyobjc-framework-AppKit")
             return
 
         try:
             # Create temporary file for sharing (NSSharingService requires a file path)
             # Use a descriptive filename based on locomotive name
-            loco_name = self.current_loco.name.replace('/', '_').replace('\\', '_')
+            loco_name = self.current_loco.name.replace('/',
+                                                       '_').replace('\\', '_')
             if not loco_name:
                 loco_name = f"locomotive_{self.current_loco.address}"
-            
+
             # Create temporary file in system temp directory
             temp_dir = tempfile.gettempdir()
             temp_filename = f"{loco_name}_{uuid.uuid4().hex[:8]}.z21loco"
             output_path = Path(temp_dir) / temp_filename
-            
+
             # Use the existing export_z21_loco logic but without showing success message
             # We'll call the export logic directly
             import shutil
@@ -2447,7 +3108,8 @@ Be accurate and extract all visible functions."""
                                 if 'functions' in tables:
                                     source_cursor.execute(
                                         "PRAGMA table_info(functions)")
-                                    func_columns_info = source_cursor.fetchall()
+                                    func_columns_info = source_cursor.fetchall(
+                                    )
                                     func_column_names = [
                                         col[1] for col in func_columns_info
                                     ]
@@ -2473,7 +3135,8 @@ Be accurate and extract all visible functions."""
                                         (vehicle_id, ))
 
                                     if self.current_loco and self.current_loco.function_details:
-                                        for func_num, func_info in self.current_loco.function_details.items():
+                                        for func_num, func_info in self.current_loco.function_details.items(
+                                        ):
                                             func_values = []
 
                                             for col in all_func_columns:
@@ -2481,43 +3144,66 @@ Be accurate and extract all visible functions."""
                                                     func_values.append(next_id)
                                                     next_id += 1
                                                 elif col == 'vehicle_id':
-                                                    func_values.append(vehicle_id)
+                                                    func_values.append(
+                                                        vehicle_id)
                                                 elif col == 'function':
-                                                    func_values.append(func_num)
+                                                    func_values.append(
+                                                        func_num)
                                                 elif col == 'position':
-                                                    func_values.append(func_info.position)
+                                                    func_values.append(
+                                                        func_info.position)
                                                 elif col == 'shortcut':
-                                                    func_values.append(func_info.shortcut or '')
+                                                    func_values.append(
+                                                        func_info.shortcut
+                                                        or '')
                                                 elif col == 'time':
                                                     source_cursor.execute(
                                                         "SELECT time FROM functions WHERE vehicle_id = ? AND function = ? LIMIT 1",
                                                         (vehicle_id, func_num))
-                                                    orig_time_row = source_cursor.fetchone()
+                                                    orig_time_row = source_cursor.fetchone(
+                                                    )
 
-                                                    if orig_time_row and orig_time_row[0] is not None:
-                                                        orig_time_str = str(orig_time_row[0])
+                                                    if orig_time_row and orig_time_row[
+                                                            0] is not None:
+                                                        orig_time_str = str(
+                                                            orig_time_row[0])
                                                         try:
-                                                            time_float = float(orig_time_str)
+                                                            time_float = float(
+                                                                orig_time_str)
                                                             if time_float == 0:
-                                                                func_values.append('0.000000')
+                                                                func_values.append(
+                                                                    '0.000000')
                                                             else:
-                                                                func_values.append(orig_time_str)
-                                                        except (ValueError, TypeError):
-                                                            func_values.append('0.000000')
+                                                                func_values.append(
+                                                                    orig_time_str
+                                                                )
+                                                        except (ValueError,
+                                                                TypeError):
+                                                            func_values.append(
+                                                                '0.000000')
                                                     else:
                                                         time_val = func_info.time or '0'
                                                         try:
-                                                            time_float = float(time_val)
+                                                            time_float = float(
+                                                                time_val)
                                                             if time_float == 0:
-                                                                func_values.append('0.000000')
+                                                                func_values.append(
+                                                                    '0.000000')
                                                             else:
-                                                                func_values.append(str(time_val))
-                                                        except (ValueError, TypeError):
-                                                            func_values.append('0')
+                                                                func_values.append(
+                                                                    str(time_val
+                                                                        ))
+                                                        except (ValueError,
+                                                                TypeError):
+                                                            func_values.append(
+                                                                '0')
                                                 elif col == 'image_name':
-                                                    func_values.append(func_info.image_name or '')
+                                                    func_values.append(
+                                                        func_info.image_name
+                                                        or '')
                                                 elif col == 'button_type':
-                                                    func_values.append(func_info.button_type)
+                                                    func_values.append(
+                                                        func_info.button_type)
                                                 elif col == 'is_configured':
                                                     func_values.append(0)
                                                 elif col == 'show_function_number':
@@ -2530,7 +3216,9 @@ Be accurate and extract all visible functions."""
                                                     f"INSERT INTO functions ({', '.join(all_func_columns)}) VALUES ({', '.join(['?' for _ in all_func_columns])})",
                                                     tuple(func_values))
                                             except Exception as e:
-                                                print(f"Error inserting function {func_num}: {e}")
+                                                print(
+                                                    f"Error inserting function {func_num}: {e}"
+                                                )
 
                         new_db.commit()
                         new_db.close()
@@ -2547,21 +3235,29 @@ Be accurate and extract all visible functions."""
                         if self.current_loco.image_name:
                             for filename in input_zip.namelist():
                                 if self.current_loco.image_name in filename or filename.endswith(
-                                        f"lok_{self.current_loco.address}.png"):
+                                        f"lok_{self.current_loco.address}.png"
+                                ):
                                     image_data = input_zip.read(filename)
                                     if filename.endswith('.png'):
-                                        image_filename = filename.split('/')[-1]
+                                        image_filename = filename.split(
+                                            '/')[-1]
                                     else:
                                         image_filename = f"lok_{self.current_loco.address}.png"
-                                    (export_path / image_filename).write_bytes(image_data)
+                                    (export_path /
+                                     image_filename).write_bytes(image_data)
                                     break
 
                         # Create ZIP file
-                        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as output_zip:
-                            output_zip.write(new_db_path, f"{export_dir}/Loco.sqlite")
+                        with zipfile.ZipFile(
+                                output_path, 'w',
+                                zipfile.ZIP_DEFLATED) as output_zip:
+                            output_zip.write(new_db_path,
+                                             f"{export_dir}/Loco.sqlite")
                             if self.current_loco.image_name:
                                 for img_file in export_path.glob("*.png"):
-                                    output_zip.write(img_file, f"{export_dir}/{img_file.name}")
+                                    output_zip.write(
+                                        img_file,
+                                        f"{export_dir}/{img_file.name}")
 
                     finally:
                         Path(source_db_path).unlink()
@@ -2571,87 +3267,95 @@ Be accurate and extract all visible functions."""
                 # Convert Path to NSURL
                 file_path_str = str(output_path.absolute())
                 file_url = NSURL.fileURLWithPath_(file_path_str)
-                
+
                 # Create NSArray with file URL for sharing
                 file_array = NSArray.arrayWithObject_(file_url)
-                
+
                 # Get AirDrop sharing service
                 # AirDrop service may fail for several reasons:
                 # 1. AirDrop is disabled in System Settings
                 # 2. Bluetooth/WiFi is turned off
                 # 3. The service name is incorrect for this macOS version
                 # 4. AirDrop is not available (older macOS versions)
-                
+
                 sharing_service = None
-                
+
                 # Method 1: Try with the standard AirDrop service name
                 try:
                     sharing_service = NSSharingService.sharingServiceNamed_(
-                        'com.apple.share.AirDrop'
-                    )
+                        'com.apple.share.AirDrop')
                     if sharing_service:
-                        print(f"✓ Found AirDrop service via name: {sharing_service.title()}")
+                        print(
+                            f"✓ Found AirDrop service via name: {sharing_service.title()}"
+                        )
                 except Exception as e:
                     print(f"✗ Method 1 failed: {e}")
-                
+
                 # Method 2: If that fails, try to find AirDrop from available services
                 # This is more reliable as it queries what services are actually available
                 if not sharing_service:
                     try:
                         # Get all available sharing services for the file
-                        available_services = NSSharingService.sharingServicesForItems_(file_array)
-                        print(f"Available sharing services: {[s.title() for s in available_services]}")
-                        
+                        available_services = NSSharingService.sharingServicesForItems_(
+                            file_array)
+                        print(
+                            f"Available sharing services: {[s.title() for s in available_services]}"
+                        )
+
                         for service in available_services:
                             # Check if this is AirDrop by title or identifier
                             service_title = service.title()
-                            if 'AirDrop' in service_title or 'airdrop' in service_title.lower():
+                            if 'AirDrop' in service_title or 'airdrop' in service_title.lower(
+                            ):
                                 sharing_service = service
-                                print(f"✓ Found AirDrop service via available services: {service_title}")
+                                print(
+                                    f"✓ Found AirDrop service via available services: {service_title}"
+                                )
                                 break
                     except Exception as e:
                         print(f"✗ Method 2 failed: {e}")
-                
+
                 # Method 3: Try alternative service name (for older macOS versions)
                 if not sharing_service:
                     try:
                         # Some macOS versions use different identifiers
                         sharing_service = NSSharingService.sharingServiceNamed_(
-                            'NSSharingServiceNameAirDrop'
-                        )
+                            'NSSharingServiceNameAirDrop')
                         if sharing_service:
-                            print(f"✓ Found AirDrop service via alternative name")
+                            print(
+                                f"✓ Found AirDrop service via alternative name"
+                            )
                     except Exception as e:
                         print(f"✗ Method 3 failed: {e}")
-                
+
                 if sharing_service:
                     # Check if sharing service can perform with items
                     if sharing_service.canPerformWithItems_(file_array):
                         # Perform sharing - this will open the AirDrop share dialog
                         sharing_service.performWithItems_(file_array)
-                        
+
                     else:
                         # Fallback: open AirDrop window and show file
                         subprocess.run(['open', 'airdrop://'], check=False)
-                        subprocess.run(['open', '-R', file_path_str], check=True)
+                        subprocess.run(['open', '-R', file_path_str],
+                                       check=True)
                         messagebox.showinfo(
                             "Share with AirDrop",
                             f"File exported to:\n{output_path}\n\n"
-                            "AirDrop window opened. Drag the file to share."
-                        )
+                            "AirDrop window opened. Drag the file to share.")
                 else:
                     # AirDrop service not available - possible reasons:
                     # 1. AirDrop is disabled in System Settings > General > AirDrop
                     # 2. Bluetooth/WiFi is turned off
                     # 3. macOS version doesn't support AirDrop sharing service
                     # 4. AirDrop is not available on this Mac
-                    
+
                     print("⚠ AirDrop sharing service not available")
                     print("  Possible reasons:")
                     print("  1. AirDrop is disabled in System Settings")
                     print("  2. Bluetooth/WiFi is turned off")
                     print("  3. AirDrop not available on this Mac")
-                    
+
                     # Fallback: open AirDrop window and show file
                     subprocess.run(['open', 'airdrop://'], check=False)
                     subprocess.run(['open', '-R', file_path_str], check=True)
@@ -2665,23 +3369,21 @@ Be accurate and extract all visible functions."""
                         "• AirDrop not available on this Mac\n\n"
                         "AirDrop window opened. Please drag the file manually to share."
                     )
-                    
+
             except Exception as e:
                 # Fallback: show file in Finder
                 try:
-                    subprocess.run(['open', '-R', str(output_path)], check=True)
+                    subprocess.run(
+                        ['open', '-R', str(output_path)], check=True)
                     subprocess.run(['open', 'airdrop://'], check=False)
                     messagebox.showinfo(
-                        "File Ready",
-                        f"File exported to:\n{output_path}\n\n"
-                        "File shown in Finder. Drag to AirDrop to share."
-                    )
+                        "File Ready", f"File exported to:\n{output_path}\n\n"
+                        "File shown in Finder. Drag to AirDrop to share.")
                 except Exception as e2:
                     messagebox.showinfo(
                         "Export Complete",
                         f"File exported to:\n{output_path}\n\n"
-                        "Please manually share this file via AirDrop."
-                    )
+                        "Please manually share this file via AirDrop.")
             finally:
                 # Note: We don't delete the temp file immediately because
                 # AirDrop sharing happens asynchronously. The file will be cleaned up
@@ -2691,6 +3393,210 @@ Be accurate and extract all visible functions."""
         except Exception as e:
             messagebox.showerror("Share Error",
                                  f"Failed to share locomotive: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def import_z21_loco(self):
+        """Import locomotive from z21loco file."""
+        if not self.z21_data or not self.parser:
+            self.set_status_message("No Z21 data loaded.")
+            return
+
+        # Ask user to select z21loco file
+        import_file = filedialog.askopenfilename(title="Import Z21 Loco",
+                                                 filetypes=[("Z21 Loco files",
+                                                             "*.z21loco"),
+                                                            ("All files",
+                                                             "*.*")])
+
+        if not import_file:
+            return  # User cancelled
+
+        import_path = Path(import_file)
+
+        try:
+            # Open z21loco file (ZIP format)
+            with zipfile.ZipFile(import_path, 'r') as import_zip:
+                # Find Loco.sqlite file
+                sqlite_files = [
+                    f for f in import_zip.namelist()
+                    if f.endswith('Loco.sqlite')
+                ]
+
+                if not sqlite_files:
+                    messagebox.showerror(
+                        "Error", "No Loco.sqlite file found in z21loco file.")
+                    return
+
+                sqlite_file = sqlite_files[0]
+                sqlite_data = import_zip.read(sqlite_file)
+
+                # Extract to temporary file
+                with tempfile.NamedTemporaryFile(delete=False,
+                                                 suffix='.sqlite') as tmp:
+                    tmp.write(sqlite_data)
+                    tmp_path = tmp.name
+
+                try:
+                    # Connect to imported database
+                    import_db = sqlite3.connect(tmp_path)
+                    import_db.row_factory = sqlite3.Row
+                    import_cursor = import_db.cursor()
+
+                    # Get vehicle data from imported database
+                    import_cursor.execute("""
+                        SELECT * FROM vehicles WHERE type = 0 LIMIT 1
+                    """)
+                    vehicle_row = import_cursor.fetchone()
+
+                    if not vehicle_row:
+                        messagebox.showerror(
+                            "Error", "No locomotive found in z21loco file.")
+                        return
+
+                    # Create Locomotive object from imported data
+                    imported_loco = Locomotive()
+                    imported_loco.address = vehicle_row['address'] or 0
+                    imported_loco.name = vehicle_row['name'] or ''
+                    imported_loco.speed = vehicle_row['max_speed'] or 0
+                    imported_loco.direction = (
+                        vehicle_row['traction_direction'] or 0) == 1
+                    imported_loco.image_name = vehicle_row['image_name'] or ''
+                    imported_loco.full_name = vehicle_row['full_name'] or ''
+                    imported_loco.railway = vehicle_row['railway'] or ''
+                    imported_loco.description = vehicle_row['description'] or ''
+                    imported_loco.article_number = vehicle_row[
+                        'article_number'] or ''
+                    imported_loco.decoder_type = vehicle_row[
+                        'decoder_type'] or ''
+                    imported_loco.build_year = vehicle_row['build_year'] or ''
+                    imported_loco.buffer_length = vehicle_row[
+                        'buffer_lenght'] or ''
+                    imported_loco.model_buffer_length = vehicle_row[
+                        'model_buffer_lenght'] or ''
+                    imported_loco.service_weight = vehicle_row[
+                        'service_weight'] or ''
+                    imported_loco.model_weight = vehicle_row[
+                        'model_weight'] or ''
+                    imported_loco.rmin = vehicle_row['rmin'] or ''
+                    imported_loco.ip = vehicle_row['ip'] or ''
+                    imported_loco.drivers_cab = vehicle_row['drivers_cab'] or ''
+                    imported_loco.active = bool(
+                        vehicle_row['active']
+                    ) if vehicle_row['active'] is not None else True
+                    imported_loco.speed_display = vehicle_row[
+                        'speed_display'] or 0
+                    imported_loco.rail_vehicle_type = vehicle_row['type'] or 0
+
+                    # Check for in_stock_since field
+                    import_cursor.execute("PRAGMA table_info(vehicles)")
+                    columns = [row[1] for row in import_cursor.fetchall()]
+                    for field_name in [
+                            'in_stock_since', 'inStockSince',
+                            'in_stock_since_date'
+                    ]:
+                        if field_name in columns:
+                            imported_loco.in_stock_since = vehicle_row[
+                                field_name] or ''
+                            break
+
+                    # Get functions from imported database
+                    vehicle_id = vehicle_row['id']
+                    import_cursor.execute(
+                        """
+                        SELECT * FROM functions WHERE vehicle_id = ?
+                    """, (vehicle_id, ))
+
+                    for func_row in import_cursor.fetchall():
+                        func_num = func_row['function']
+                        if func_num is not None:
+                            func_info = FunctionInfo()
+                            func_info.function_number = func_num
+                            func_info.image_name = func_row['image_name'] or ''
+                            func_info.shortcut = func_row['shortcut'] or ''
+                            func_info.position = func_row['position'] or 0
+                            func_info.time = str(
+                                func_row['time']
+                            ) if func_row['time'] is not None else '0'
+                            func_info.button_type = func_row['button_type'] or 0
+                            func_info.is_active = True
+                            imported_loco.function_details[
+                                func_num] = func_info
+                            imported_loco.functions[func_num] = True
+
+                    # Get categories
+                    import_cursor.execute(
+                        """
+                        SELECT c.name FROM categories c
+                        JOIN vehicles_to_categories vtc ON c.id = vtc.category_id
+                        WHERE vtc.vehicle_id = ?
+                    """, (vehicle_id, ))
+                    imported_loco.categories = [
+                        row['name'] for row in import_cursor.fetchall()
+                    ]
+
+                    # Get regulation_step
+                    import_cursor.execute(
+                        """
+                        SELECT regulation_step FROM traction_list WHERE loco_id = ?
+                    """, (vehicle_id, ))
+                    reg_row = import_cursor.fetchone()
+                    if reg_row:
+                        imported_loco.regulation_step = reg_row[
+                            'regulation_step']
+
+                    import_db.close()
+
+                    # Mark as newly imported (force INSERT instead of UPDATE on save)
+                    imported_loco._is_new_import = True  # type: ignore
+
+                    # Add locomotive to z21_data (address conflicts are allowed)
+                    self.z21_data.locomotives.append(imported_loco)
+
+                    # Copy image file if exists
+                    if imported_loco.image_name:
+                        # Look for image in z21loco file
+                        image_found = False
+                        for filename in import_zip.namelist():
+                            if imported_loco.image_name in filename or filename.endswith(
+                                    imported_loco.image_name):
+                                # Copy image to current z21 file
+                                image_data = import_zip.read(filename)
+                                with zipfile.ZipFile(self.z21_file,
+                                                     'a') as current_zip:
+                                    # Check if image already exists
+                                    if imported_loco.image_name not in current_zip.namelist(
+                                    ):
+                                        current_zip.writestr(
+                                            imported_loco.image_name,
+                                            image_data)
+                                image_found = True
+                                break
+
+                        if not image_found:
+                            # Image not found in z21loco, keep the image_name but it might not exist
+                            pass
+
+                    # Save changes to file
+                    self.parser.write(self.z21_data, self.z21_file)
+
+                    # Update list and status
+                    self.populate_list(self.search_var.get(
+                    ) if hasattr(self, 'search_var') else "")
+                    self.update_status_count()
+
+                    # Show success message
+                    self.set_status_message(
+                        f"Locomotive '{imported_loco.name}' (Address {imported_loco.address}) imported successfully."
+                    )
+
+                finally:
+                    # Clean up temp file
+                    Path(tmp_path).unlink()
+
+        except Exception as e:
+            messagebox.showerror("Import Error",
+                                 f"Failed to import locomotive: {e}")
             import traceback
             traceback.print_exc()
 
@@ -2815,8 +3721,9 @@ Be accurate and extract all visible functions."""
     def save_function_changes(self):
         """Save all function changes to the Z21 file."""
         if not self.current_loco or not self.z21_data or not self.parser:
-            messagebox.showerror("Error",
-                                 "No locomotive selected or data not loaded.")
+            # Show error in status bar
+            self.set_status_message(
+                "No locomotive selected or data not loaded.")
             return
 
         try:
@@ -2827,13 +3734,14 @@ Be accurate and extract all visible functions."""
 
             # Write changes back to file
             self.parser.write(self.z21_data, self.z21_file)
-            messagebox.showinfo(
-                "Success", "All function changes saved successfully to file!")
+            # Show success message in status bar instead of messagebox
+            self.set_status_message(
+                "All function changes saved successfully to file!")
         except Exception as write_error:
-            messagebox.showerror(
-                "Write Error",
-                f"Failed to write changes to file: {write_error}\n\n"
-                f"Changes have been saved in memory but not written to disk.")
+            # Show error in status bar
+            self.set_status_message(
+                f"Failed to write changes to file: {write_error}. Changes saved in memory but not written to disk."
+            )
 
     def get_next_unused_function_number(self):
         """Get the next unused function number for the current locomotive."""
@@ -3119,12 +4027,15 @@ Be accurate and extract all visible functions."""
 
                 # Update display
                 self.update_functions()
+                self.update_overview(
+                )  # Update Function Summary in Overview tab
 
                 # Close dialog
                 dialog.destroy()
 
-                messagebox.showinfo(
-                    "Success", f"Function F{func_num} added successfully!")
+                # Show success message in status bar instead of messagebox
+                self.set_status_message(
+                    f"Function F{func_num} added successfully!")
 
             except ValueError as e:
                 messagebox.showerror("Error", f"Invalid input: {e}")
@@ -3394,12 +4305,13 @@ Be accurate and extract all visible functions."""
 
                 # Update display
                 self.update_functions()
+                self.update_overview(
+                )  # Update Function Summary in Overview tab
 
                 # Close dialog
                 dialog.destroy()
 
-                messagebox.showinfo(
-                    "Success",
+                self.set_status_message(
                     f"Function F{new_func_num} updated successfully!")
 
             except ValueError as e:
@@ -3433,6 +4345,7 @@ Be accurate and extract all visible functions."""
 
             # Update display
             self.update_functions()
+            self.update_overview()  # Update Function Summary in Overview tab
 
             # Close dialog
             dialog.destroy()
@@ -3690,9 +4603,14 @@ Be accurate and extract all visible functions."""
                 image_path = None
                 for filename in zf.namelist():
                     # Match by exact filename or UUID part
-                    if image_name in filename or filename.endswith(image_name):
-                        image_path = filename
-                        break
+                    # Check if filename ends with image_name (handles subdirectories)
+                    if filename.endswith(image_name) or image_name in filename:
+                        # Prefer exact match at end of path
+                        if filename.endswith(image_name):
+                            image_path = filename
+                            break
+                        elif not image_path:  # Use first match if no exact end match found
+                            image_path = filename
 
                 if image_path:
                     # Extract image data
@@ -3716,11 +4634,18 @@ Be accurate and extract all visible functions."""
 
                     # Convert to PhotoImage
                     return ImageTk.PhotoImage(bg_img)
+                else:
+                    # Image file not found in ZIP
+                    print(
+                        f"Warning: Image file '{image_name}' not found in ZIP file"
+                    )
+                    return None
         except Exception as e:
-            # Silently fail if image can't be loaded
-            pass
-
-        return None
+            # Debug: print error to help diagnose issues
+            print(f"Error loading locomotive image '{image_name}': {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
         return None
 
