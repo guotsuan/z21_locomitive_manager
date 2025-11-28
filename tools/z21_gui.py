@@ -62,16 +62,6 @@ except Exception as e:
     )
     HAS_PADDLEOCR = False
 
-# Try to import EasyOCR
-try:
-    import easyocr
-    HAS_EASYOCR = True
-except (ImportError, ModuleNotFoundError):
-    HAS_EASYOCR = False
-except Exception as e:
-    print(f"Warning: EasyOCR import failed: {e}")
-    HAS_EASYOCR = False
-
 # Add project root to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -137,26 +127,6 @@ class Z21GUI:
             except Exception:
                 return {}
         return {}
-
-    def set_status_message(self, message: str, timeout: int = 5000):
-        """Set status message and clear it after timeout (default 5 seconds).
-        
-        Args:
-            message: Status message to display
-            timeout: Timeout in milliseconds (default 5000ms = 5 seconds)
-        """
-        # Cancel any existing timeout
-        if self.status_timeout_id is not None:
-            self.root.after_cancel(self.status_timeout_id)
-            self.status_timeout_id = None
-
-        # Set the message
-        self.status_label.config(text=message)
-
-        # Schedule clearing the message after timeout
-        self.status_timeout_id = self.root.after(
-            timeout,
-            lambda: self.status_label.config(text=self.default_status_text))
 
     def update_status_count(self):
         """Update the default status text with current locomotive count."""
@@ -899,43 +869,11 @@ class Z21GUI:
                                   command=canvas.yview)
         scrollable_frame = tk.Frame(canvas, bg='#F0F0F0')
 
-        def on_frame_configure(event):
-            """Update scroll region when frame size changes."""
-            canvas.configure(scrollregion=canvas.bbox("all"))
-
-        def on_canvas_configure(event):
-            """Update frame width to match canvas."""
-            canvas_width = event.width
-            canvas.itemconfig(canvas_window, width=canvas_width)
-
-            # Don't trigger layout recalculation if mouse is over function icons
-            # This prevents layout flicker during hover
-            if hasattr(self, '_mouse_over_function_icon'
-                       ) and self._mouse_over_function_icon:
-                return
-
-            # Clear cached canvas width to trigger layout recalculation on next update
-            # This allows function icons to adjust when window size changes
-            if hasattr(self, '_cached_canvas_width'):
-                old_width = self._cached_canvas_width
-                # Only clear cache if width changed significantly (20px) to prevent flicker
-                if old_width is None or abs(canvas_width - old_width) >= 20:
-                    self._cached_canvas_width = None
-                    self._cached_cols = None
-                    # If we're currently viewing the Functions tab, update the layout
-                    try:
-                        if (hasattr(self, 'notebook') and self.notebook.index(
-                                self.notebook.select()) == 1
-                                and hasattr(self, 'current_loco')
-                                and self.current_loco):
-                            # Schedule layout update with minimal delay to ensure canvas width is updated
-                            if not hasattr(self, '_layout_update_scheduled'):
-                                self._layout_update_scheduled = True
-                                # Use after_idle to ensure canvas is fully configured, then short delay
-                                self.root.after_idle(lambda: self.root.after(
-                                    50, self._update_functions_layout))
-                    except:
-                        pass
+        # Create canvas window before bindings so it can be referenced
+        canvas_window = canvas.create_window((0, 0),
+                                             window=scrollable_frame,
+                                             anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
 
         def on_mousewheel(event):
             """Handle mouse wheel scrolling (two-finger scroll on trackpad)."""
@@ -981,6 +919,15 @@ class Z21GUI:
                     bind_mousewheel(child)
                 except:
                     pass
+
+        def on_frame_configure(event):
+            """Update scroll region when frame size changes."""
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def on_canvas_configure(event):
+            """Update frame width to match canvas."""
+            canvas_width = event.width
+            canvas.itemconfig(canvas_window, width=canvas_width)
 
         scrollable_frame.bind("<Configure>", on_frame_configure)
         canvas.bind("<Configure>", on_canvas_configure)
@@ -1032,11 +979,6 @@ class Z21GUI:
             if self.notebook.index(self.notebook.select()) == 1 else None,
             add='+')
 
-        canvas_window = canvas.create_window((0, 0),
-                                             window=scrollable_frame,
-                                             anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
         # Enable focus for keyboard scrolling
         canvas.focus_set()
 
@@ -1053,37 +995,6 @@ class Z21GUI:
 
         # Store update function for later use
         self.update_scroll_bindings = update_bindings
-
-        # Also bind to main window size changes to ensure Functions tab responds
-        def on_window_configure(event):
-            """Handle main window size changes."""
-            # Don't trigger layout update if mouse is over function icons
-            if hasattr(self, '_mouse_over_function_icon'
-                       ) and self._mouse_over_function_icon:
-                return
-            # Only respond if Functions tab is selected
-            try:
-                if (hasattr(self, 'notebook')
-                        and self.notebook.index(self.notebook.select()) == 1
-                        and hasattr(self, 'current_loco')
-                        and self.current_loco):
-                    # Clear cache to force recalculation
-                    if hasattr(self, '_cached_canvas_width'):
-                        self._cached_canvas_width = None
-                        self._cached_cols = None
-                    # Schedule layout update immediately
-                    if not hasattr(self, '_layout_update_scheduled'):
-                        self._layout_update_scheduled = True
-                        # Use shorter delay for more responsive updates
-                        self.root.after_idle(lambda: self.root.after(
-                            50, self._update_functions_layout))
-            except:
-                pass
-
-        # Bind to root window and functions_frame for size changes
-        # Note: canvas.configure is already bound above, no need to bind again
-        self.root.bind("<Configure>", on_window_configure, add='+')
-        self.functions_frame.bind("<Configure>", on_window_configure, add='+')
 
     def load_data(self):
         """Load Z21 file data."""
@@ -1259,7 +1170,7 @@ class Z21GUI:
     def create_new_locomotive(self):
         """Create a new locomotive with empty information."""
         if not self.z21_data:
-            messagebox.showerror("Error", "No Z21 data loaded.")
+            self.set_status_message("Error: No Z21 data loaded.")
             return
 
         # Find next available address
@@ -1268,9 +1179,9 @@ class Z21GUI:
         while new_address in used_addresses:
             new_address += 1
             if new_address > 9999:  # Safety limit
-                messagebox.showerror(
-                    "Error",
-                    "Too many locomotives. Cannot find available address.")
+                self.set_status_message(
+                    "Error: Too many locomotives. Cannot find available address."
+                )
                 return
 
         # Create new locomotive with empty/default values
@@ -1314,10 +1225,10 @@ class Z21GUI:
         # Update status bar with new locomotive count
         self.update_status_count()
 
-        messagebox.showinfo(
-            "New Locomotive",
-            f"Created new locomotive with address {new_address}.\n"
-            f"You can now edit the details.")
+        # Show success message in status label
+        self.set_status_message(
+            f"Created new locomotive with address {new_address}. You can now edit the details."
+        )
 
     def delete_selected_locomotive(self):
         """Delete the currently selected locomotive."""
@@ -2164,85 +2075,6 @@ Function Details:  {len(loco.function_details)} available
             # Return empty string if no text found (don't raise exception)
             return text if text.strip() else ""
 
-    def extract_text_with_easyocr(self, file_path: str) -> str:
-        """Extract text from image using EasyOCR (used for scan to functions)."""
-        if not HAS_EASYOCR:
-            raise ImportError(
-                "EasyOCR is required for 'Scan to Functions' feature.\n\n"
-                "Install it with: pip install easyocr\n\n"
-                "Note: First-time use will download language models (~500MB).")
-
-        if not HAS_PIL:
-            raise Exception("PIL/Pillow is required for image processing.")
-
-        file_path = Path(file_path)
-
-        try:
-            import easyocr
-
-            # Initialize EasyOCR reader (English language)
-            # This will download models on first use
-            print("Initializing EasyOCR...")
-            print(
-                "Note: First-time use will download language models (~500MB)")
-            reader = easyocr.Reader(
-                ['en'], gpu=False)  # Use CPU mode for compatibility
-            print("✓ EasyOCR initialized successfully")
-
-            if file_path.suffix.lower() == '.pdf':
-                # Handle PDF files
-                try:
-                    from pdf2image import convert_from_path
-                except ImportError:
-                    raise Exception(
-                        "pdf2image is required for PDF processing.\n\n"
-                        "Install it with: pip install pdf2image\n"
-                        "Also install poppler:\n"
-                        "  macOS: brew install poppler\n"
-                        "  Linux: sudo apt-get install poppler-utils")
-
-                # Convert PDF to images
-                images = convert_from_path(str(file_path))
-                # Extract text from all pages
-                text_parts = []
-                for image in images:
-                    # Convert PIL Image to numpy array
-                    import numpy as np
-                    img_array = np.array(image)
-                    # Read text from image
-                    results = reader.readtext(img_array)
-                    # Extract text from results
-                    page_text = [result[1] for result in results]
-                    page_text_str = '\n'.join(page_text)
-                    if page_text_str.strip():  # Only add non-empty pages
-                        text_parts.append(page_text_str)
-                return "\n".join(text_parts) if text_parts else ""
-            else:
-                # Handle image files
-                image = Image.open(file_path)
-                # Convert PIL Image to numpy array
-                import numpy as np
-                img_array = np.array(image)
-
-                print("Calling EasyOCR readtext method...")
-                # Read text from image
-                results = reader.readtext(img_array)
-
-                # Extract text from results
-                # EasyOCR returns list of tuples: (bbox, text, confidence)
-                text_lines = [result[1] for result in results]
-                text = '\n'.join(text_lines)
-
-                print(f"✓ EasyOCR extracted {len(text_lines)} text lines")
-                # Return empty string if no text found (don't raise exception)
-                return text if text.strip() else ""
-
-        except ImportError as e:
-            raise ImportError(f"EasyOCR import failed: {e}\n\n"
-                              "Install EasyOCR with: pip install easyocr")
-        except Exception as e:
-            raise Exception(f"EasyOCR failed: {e}")
-
     def parse_and_fill_fields(self, text: str):
         """Parse extracted text and fill locomotive fields."""
         text = text.upper(
@@ -2632,197 +2464,6 @@ Function Details:  {len(loco.function_details)} available
             import traceback
             traceback.print_exc()
             self.set_status_message("Failed to scan functions from JSON")
-
-    def extract_functions_with_ai(self, image_path: str) -> list:
-        """Extract function information from image using AI (OpenAI GPT-4 Vision).
-        Returns list of tuples: [(function_number, function_name), ...]
-        """
-        try:
-            import openai
-        except ImportError:
-            raise ImportError(
-                "openai package is required for AI extraction.\n\n"
-                "Install it with: pip install openai\n\n"
-                "You also need to set your OpenAI API key:\n"
-                "  - Set environment variable: export OPENAI_API_KEY='your-key'\n"
-                "  - Or create a config file: ~/.openai/config.json")
-
-        # Check for API key
-        import os
-        api_key = os.getenv('OPENAI_API_KEY')
-        if not api_key:
-            # Try to read from config file
-            config_path = Path.home() / '.openai' / 'config.json'
-            if config_path.exists():
-                try:
-                    with open(config_path, 'r') as f:
-                        config = json.load(f)
-                        api_key = config.get('api_key')
-                except:
-                    pass
-
-        if not api_key:
-            raise ValueError("OpenAI API key not found.\n\n"
-                             "Please set your API key:\n"
-                             "  export OPENAI_API_KEY='your-key-here'\n\n"
-                             "Or create ~/.openai/config.json with:\n"
-                             '  {"api_key": "your-key-here"}')
-
-        # Initialize OpenAI client
-        client = openai.OpenAI(api_key=api_key)
-
-        # Read image file
-        if not HAS_PIL:
-            raise ImportError("PIL/Pillow is required for image processing.")
-
-        image = Image.open(image_path)
-
-        # Convert to base64 for API
-        import base64
-        import io
-
-        buffered = io.BytesIO()
-        # Convert to RGB if necessary (for PNG with transparency)
-        if image.mode in ('RGBA', 'LA', 'P'):
-            rgb_image = Image.new('RGB', image.size, (255, 255, 255))
-            if image.mode == 'P':
-                image = image.convert('RGBA')
-            rgb_image.paste(
-                image,
-                mask=image.split()[-1] if image.mode == 'RGBA' else None)
-            image = rgb_image
-
-        image.save(buffered, format="PNG")
-        image_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-
-        # Prepare prompt for AI
-        prompt = """Analyze this image of a locomotive function list or manual page. 
-Extract all function numbers and their corresponding names/descriptions.
-
-Look for patterns like:
-- F0: Light
-- F1: Horn
-- Function 0: Light
-- F0 Light
-- etc.
-
-Return ONLY a JSON array of objects, each with "number" and "name" fields.
-Example format:
-[
-  {"number": 0, "name": "Light"},
-  {"number": 1, "name": "Horn"},
-  {"number": 2, "name": "Bell"}
-]
-
-If you cannot find any functions, return an empty array [].
-Be accurate and extract all visible functions."""
-
-        # Call OpenAI Vision API
-        self.status_label.config(
-            text="Calling AI model to extract functions...")
-        self.root.update()
-
-        response = client.chat.completions.create(
-            model="gpt-4o",  # or "gpt-4-vision-preview" for older models
-            messages=[{
-                "role":
-                "user",
-                "content": [{
-                    "type": "text",
-                    "text": prompt
-                }, {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/png;base64,{image_base64}"
-                    }
-                }]
-            }],
-            max_tokens=1000)
-
-        # Parse response
-        response_text = response.choices[0].message.content.strip()
-
-        # Try to extract JSON from response (might have markdown code blocks)
-        import json
-        json_match = re.search(r'\[.*\]', response_text, re.DOTALL)
-        if json_match:
-            response_text = json_match.group(0)
-
-        try:
-            functions_data = json.loads(response_text)
-            functions = []
-            for item in functions_data:
-                if isinstance(item,
-                              dict) and 'number' in item and 'name' in item:
-                    func_num = int(item['number'])
-                    func_name = str(item['name']).strip()
-                    if 0 <= func_num <= 128 and func_name:
-                        functions.append((func_num, func_name))
-            return functions
-        except json.JSONDecodeError as e:
-            # Fallback: try to parse text response
-            raise Exception(
-                f"Failed to parse AI response as JSON: {e}\nResponse: {response_text}"
-            )
-
-    def parse_functions_from_text(self, text: str) -> list:
-        """Parse function numbers and names from OCR text.
-        Returns list of tuples: [(function_number, function_name), ...]
-        """
-        functions = []
-        text_lines = text.split('\n')
-
-        # Common patterns for function listings:
-        # F0: Light, F1: Horn, F0 Light, F1 Horn, Function 0: Light, etc.
-        patterns = [
-            r'\bF(\d+)[:\s]+([A-Z][A-Z\s]+?)(?=\s+F\d+|\s*$|\n)',  # F0: Light
-            r'\bF(\d+)\s+([A-Z][A-Z\s]+?)(?=\s+F\d+|\s*$|\n)',  # F0 Light
-            r'\bFUNCTION\s+(\d+)[:\s]+([A-Z][A-Z\s]+?)(?=\s+FUNCTION|\s*$|\n)',  # Function 0: Light
-            r'\bF(\d+)[:\s]+([A-Za-z][A-Za-z\s]+?)(?=\s+F\d+|\s*$|\n)',  # F0: light (lowercase)
-        ]
-
-        for line in text_lines:
-            line = line.strip()
-            if not line:
-                continue
-
-            # Try each pattern
-            for pattern in patterns:
-                matches = re.finditer(pattern, line, re.IGNORECASE)
-                for match in matches:
-                    func_num = int(match.group(1))
-                    func_name = match.group(2).strip()
-
-                    # Clean up function name
-                    func_name = re.sub(r'\s+', ' ',
-                                       func_name)  # Multiple spaces to single
-                    func_name = func_name.strip()
-
-                    if func_name and 0 <= func_num <= 128:
-                        functions.append((func_num, func_name))
-
-        # Also try to find function numbers followed by names on separate lines
-        # Look for patterns like: "0" on one line, "Light" on next
-        for i in range(len(text_lines) - 1):
-            line1 = text_lines[i].strip()
-            line2 = text_lines[i + 1].strip()
-
-            # Check if line1 is just a number and line2 starts with a letter
-            if re.match(r'^\d+$', line1) and re.match(r'^[A-Za-z]', line2):
-                func_num = int(line1)
-                func_name = line2.split()[0] if line2.split() else line2
-                if 0 <= func_num <= 128:
-                    functions.append((func_num, func_name))
-
-        # Remove duplicates, keeping first occurrence
-        seen = set()
-        unique_functions = []
-        for func_num, func_name in functions:
-            if func_num not in seen:
-                seen.add(func_num)
-                unique_functions.append((func_num, func_name))
-
-        return unique_functions
 
     def generate_shortcut(self, func_name: str) -> str:
         """Generate a keyboard shortcut for a function name."""
@@ -4495,14 +4136,13 @@ Be accurate and extract all visible functions."""
                             lambda e, fnum=fn, finfo=fi: self.edit_function(
                                 fnum, finfo))
 
-                # Disable cursor change to prevent layout flicker
                 # Set flag to prevent layout updates during hover
                 def on_enter(e):
                     try:
                         # Set flag to prevent layout updates
                         self._mouse_over_function_icon = True
-                        # Disabled cursor change to prevent layout flicker
-                        # e.widget.config(cursor="hand2")
+                        # Change cursor to hand pointer on hover
+                        e.widget.config(cursor="hand2")
                     except:
                         pass
 
@@ -4514,8 +4154,8 @@ Be accurate and extract all visible functions."""
 
                         self.root.after(100,
                                         clear_flag)  # Clear flag after 100ms
-                        # Disabled cursor change to prevent layout flicker
-                        # e.widget.config(cursor="")
+                        # Reset cursor when leaving
+                        e.widget.config(cursor="")
                     except:
                         pass
 
@@ -5206,12 +4846,6 @@ Be accurate and extract all visible functions."""
             if func_info.image_name:
                 func_display += f" ({func_info.image_name})"
 
-            if not messagebox.askyesno(
-                    "Confirm Delete",
-                    f"Are you sure you want to delete function {func_display}?"
-            ):
-                return
-
             # Delete the function from locomotive
             if func_num in self.current_loco.function_details:
                 del self.current_loco.function_details[func_num]
@@ -5230,7 +4864,8 @@ Be accurate and extract all visible functions."""
             # Close dialog
             dialog.destroy()
 
-            messagebox.showinfo("Success", f"Function {func_display} deleted.")
+            # Show success message in status label
+            self.set_status_message(f"Function {func_display} deleted.")
 
         ttk.Button(button_frame,
                    text="Delete Function",
@@ -5599,6 +5234,7 @@ Be accurate and extract all visible functions."""
                               width=ICON_SIZE,
                               height=ICON_SIZE,
                               bg='white')
+        icon_frame.config(cursor="hand2")  # Show hand cursor on hover
         icon_frame.grid(row=0,
                         column=0,
                         padx=CARD_PADDING,
@@ -5612,6 +5248,7 @@ Be accurate and extract all visible functions."""
         if icon_image:
             icon_label = tk.Label(icon_frame, image=icon_image, bg='white')
             icon_label.image = icon_image  # Keep a reference
+            icon_label.config(cursor="hand2")  # Show hand cursor on hover
             icon_label.pack(expand=True)
         else:
             # Fallback: show a visible placeholder with icon name
@@ -5621,6 +5258,7 @@ Be accurate and extract all visible functions."""
                                         height=ICON_SIZE,
                                         bg='white',
                                         highlightthickness=0)
+            fallback_canvas.config(cursor="hand2")  # Show hand cursor on hover
             fallback_canvas.pack(fill=tk.BOTH, expand=True)
             # Draw a black border rectangle
             fallback_canvas.create_rectangle(5,
