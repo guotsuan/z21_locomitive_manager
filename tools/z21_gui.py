@@ -62,6 +62,16 @@ except Exception as e:
     )
     HAS_PADDLEOCR = False
 
+# Try to import EasyOCR
+try:
+    import easyocr
+    HAS_EASYOCR = True
+except (ImportError, ModuleNotFoundError):
+    HAS_EASYOCR = False
+except Exception as e:
+    print(f"Warning: EasyOCR import failed: {e}")
+    HAS_EASYOCR = False
+
 # Add project root to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -2035,6 +2045,86 @@ Function Details:  {len(loco.function_details)} available
             # Return empty string if no text found (don't raise exception)
             return text if text.strip() else ""
 
+    def extract_text_with_easyocr(self, file_path: str) -> str:
+        """Extract text from image using EasyOCR (used for scan to functions)."""
+        if not HAS_EASYOCR:
+            raise ImportError(
+                "EasyOCR is required for 'Scan to Functions' feature.\n\n"
+                "Install it with: pip install easyocr\n\n"
+                "Note: First-time use will download language models (~500MB)."
+            )
+
+        if not HAS_PIL:
+            raise Exception("PIL/Pillow is required for image processing.")
+
+        file_path = Path(file_path)
+
+        try:
+            import easyocr
+
+            # Initialize EasyOCR reader (English language)
+            # This will download models on first use
+            print("Initializing EasyOCR...")
+            print("Note: First-time use will download language models (~500MB)")
+            reader = easyocr.Reader(['en'], gpu=False)  # Use CPU mode for compatibility
+            print("✓ EasyOCR initialized successfully")
+
+            if file_path.suffix.lower() == '.pdf':
+                # Handle PDF files
+                try:
+                    from pdf2image import convert_from_path
+                except ImportError:
+                    raise Exception(
+                        "pdf2image is required for PDF processing.\n\n"
+                        "Install it with: pip install pdf2image\n"
+                        "Also install poppler:\n"
+                        "  macOS: brew install poppler\n"
+                        "  Linux: sudo apt-get install poppler-utils")
+
+                # Convert PDF to images
+                images = convert_from_path(str(file_path))
+                # Extract text from all pages
+                text_parts = []
+                for image in images:
+                    # Convert PIL Image to numpy array
+                    import numpy as np
+                    img_array = np.array(image)
+                    # Read text from image
+                    results = reader.readtext(img_array)
+                    # Extract text from results
+                    page_text = [result[1] for result in results]
+                    page_text_str = '\n'.join(page_text)
+                    if page_text_str.strip():  # Only add non-empty pages
+                        text_parts.append(page_text_str)
+                return "\n".join(text_parts) if text_parts else ""
+            else:
+                # Handle image files
+                image = Image.open(file_path)
+                # Convert PIL Image to numpy array
+                import numpy as np
+                img_array = np.array(image)
+
+                print("Calling EasyOCR readtext method...")
+                # Read text from image
+                results = reader.readtext(img_array)
+
+                # Extract text from results
+                # EasyOCR returns list of tuples: (bbox, text, confidence)
+                text_lines = [result[1] for result in results]
+                text = '\n'.join(text_lines)
+
+                print(f"✓ EasyOCR extracted {len(text_lines)} text lines")
+                # Return empty string if no text found (don't raise exception)
+                return text if text.strip() else ""
+
+        except ImportError as e:
+            raise ImportError(
+                f"EasyOCR import failed: {e}\n\n"
+                "Install EasyOCR with: pip install easyocr"
+            )
+        except Exception as e:
+            raise Exception(f"EasyOCR failed: {e}")
+
     def parse_and_fill_fields(self, text: str):
         """Parse extracted text and fill locomotive fields."""
         text = text.upper(
@@ -2207,97 +2297,186 @@ Function Details:  {len(loco.function_details)} available
                     self.description_text.insert(
                         1.0, description[:2000])  # Limit to 2000 chars
 
-    def scan_for_functions(self):
-        """Scan image for function numbers and names, then auto-add functions."""
+    def scan_from_json(self):
+        """Scan functions from train_config.json file and auto-add functions."""
         if not self.current_loco:
             messagebox.showerror("Error", "Please select a locomotive first.")
             return
 
-        # Open file dialog for image
+        # Open file dialog for JSON file
         file_path = filedialog.askopenfilename(
-            title="Select Image to Scan for Functions",
-            filetypes=[("Image files",
-                        "*.png *.jpg *.jpeg *.gif *.bmp *.tiff"),
-                       ("All files", "*.*")])
+            title="Select train_config.json File",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")])
 
         if not file_path:
             return
 
         try:
             # Show progress
-            self.status_label.config(text="Scanning image for functions...")
+            self.status_label.config(text="Reading functions from JSON...")
             self.root.update()
 
-            # Extract text using OCR (PaddleOCR preferred, fallback to pytesseract)
-            try:
-                extracted_text = self.extract_text_from_file(file_path)
-            except Exception as ocr_error:
-                raise Exception(f"OCR extraction failed: {ocr_error}")
+            # Read JSON file
+            json_path = Path(file_path)
+            if not json_path.exists():
+                raise FileNotFoundError(f"File not found: {file_path}")
 
-            if not extracted_text or not extracted_text.strip():
-                raise Exception(
-                    "No text could be extracted from the image. Please ensure:\n"
-                    "1. The image contains clear, readable text\n"
-                    "2. PaddleOCR or pytesseract is properly installed\n"
-                    "3. The image format is supported (PNG, JPG, etc.)")
+            with open(json_path, 'r', encoding='utf-8') as f:
+                config_data = json.load(f)
 
-            # Parse functions from OCR text
-            functions = self.parse_functions_from_text(extracted_text)
+            # Extract functions array
+            if 'functions' not in config_data:
+                raise ValueError("No 'functions' array found in JSON file")
 
-            if not functions:
-                messagebox.showwarning(
-                    "Warning",
-                    "No functions could be extracted from the image.")
-                self.status_label.config(
-                    text=f"Loaded {len(self.z21_data.locomotives)} locomotives"
-                )
-                return
+            functions = config_data['functions']
+            if not functions or not isinstance(functions, list):
+                raise ValueError("'functions' must be a non-empty array")
 
             # Add functions to locomotive
             added_count = 0
-            for func_num, func_name in functions:
-                if func_num not in self.current_loco.function_details:
-                    # Generate shortcut
+            updated_count = 0
+            skipped_count = 0
+            added_functions = []
+
+            for func_data in functions:
+                # Parse function number (e.g., "F0" -> 0, "F1" -> 1)
+                func_number_str = func_data.get('number', '').upper().strip()
+                if not func_number_str.startswith('F'):
+                    # Try to parse as number directly
+                    try:
+                        func_num = int(func_number_str)
+                    except ValueError:
+                        print(f"Warning: Invalid function number format: {func_number_str}, skipping")
+                        skipped_count += 1
+                        continue
+                else:
+                    try:
+                        func_num = int(func_number_str[1:])  # Remove 'F' prefix
+                    except ValueError:
+                        print(f"Warning: Invalid function number format: {func_number_str}, skipping")
+                        skipped_count += 1
+                        continue
+
+                # Get function name
+                func_name = func_data.get('name', '').strip()
+                if not func_name:
+                    func_name = f"Function {func_num}"
+
+                # Get shortcut from JSON, or generate if not provided
+                shortcut = func_data.get('shortcut', '').strip()
+                if not shortcut:
                     shortcut = self.generate_shortcut(func_name)
 
-                    # Match icon
+                # Get icon from JSON, or match if not provided
+                icon_name = func_data.get('icon', '').strip()
+                if not icon_name:
+                    # Use match_function_to_icon for best guess based on function name
                     icon_name = self.match_function_to_icon(func_name)
+                else:
+                    # Try to match icon from JSON to icon_mapping
+                    # First, check if icon_name exists directly in icon_mapping
+                    if icon_name in self.icon_mapping:
+                        # Direct match found, use it
+                        pass
+                    else:
+                        # Try to find best matching icon using the icon name from JSON
+                        matched_icon = self.match_icon_name_to_mapping(icon_name)
+                        if matched_icon:
+                            icon_name = matched_icon
+                        else:
+                            # If icon from JSON doesn't match, try matching by function name
+                            matched_icon = self.match_function_to_icon(func_name)
+                            if matched_icon:
+                                icon_name = matched_icon
+                            # If still not found, keep the original icon_name
+                            # (it might be added later or be valid)
 
-                    # Create FunctionInfo
+                # Map type to button_type
+                # "switch" -> 0, "push" -> 1, default -> 0
+                func_type = func_data.get('type', 'switch').lower().strip()
+                button_type = 0  # Default to switch
+                if func_type == 'push':
+                    button_type = 1
+                elif func_type == 'time':
+                    button_type = 2
+
+                # Check if function already exists
+                if func_num in self.current_loco.function_details:
+                    # Update existing function
+                    existing_func = self.current_loco.function_details[func_num]
+                    existing_func.shortcut = shortcut
+                    existing_func.image_name = icon_name
+                    existing_func.button_type = button_type
+                    updated_count += 1
+                else:
+                    # Create new FunctionInfo
+                    # Get next available position
+                    max_position = 0
+                    if self.current_loco.function_details:
+                        max_position = max(
+                            func_info.position
+                            for func_info in self.current_loco.function_details.values()
+                        )
+
                     func_info = FunctionInfo(
                         function_number=func_num,
                         image_name=icon_name,
                         shortcut=shortcut,
-                        position=0,
+                        position=max_position + 1,
                         time="0",
-                        button_type=0,  # Default to switch
+                        button_type=button_type,
                         is_active=True)
 
                     # Add to locomotive
                     self.current_loco.function_details[func_num] = func_info
                     self.current_loco.functions[func_num] = True
                     added_count += 1
+                    added_functions.append(f"F{func_num}")
 
+            # Show results
+            result_messages = []
             if added_count > 0:
+                result_messages.append(f"Added {added_count} new function(s): {', '.join(added_functions)}")
+            if updated_count > 0:
+                result_messages.append(f"Updated {updated_count} existing function(s)")
+            if skipped_count > 0:
+                result_messages.append(f"Skipped {skipped_count} invalid function(s)")
+
+            if added_count > 0 or updated_count > 0:
                 messagebox.showinfo(
                     "Success",
-                    f"Added {added_count} function(s) from scanned image!\n\n"
-                    f"Functions added: {', '.join([f'F{num}' for num, _ in functions if num not in self.current_loco.function_details])}"
+                    "\n".join(result_messages) if result_messages else "Functions processed successfully!"
                 )
 
                 # Update functions display
                 self.update_functions()
+                self.update_overview()  # Update Function Summary in Overview tab
             else:
-                messagebox.showinfo(
-                    "Info", "All functions from the image already exist.")
+                if skipped_count > 0:
+                    messagebox.showwarning(
+                        "Warning",
+                        f"No functions were added or updated.\n\n"
+                        f"Skipped {skipped_count} invalid function(s)."
+                    )
+                else:
+                    messagebox.showinfo(
+                        "Info", "No new functions to add. All functions already exist.")
 
-            self.status_label.config(
-                text=f"Loaded {len(self.z21_data.locomotives)} locomotives")
+            self.set_status_message(
+                f"Loaded {len(self.z21_data.locomotives)} locomotives")
 
+        except json.JSONDecodeError as e:
+            messagebox.showerror(
+                "JSON Error",
+                f"Failed to parse JSON file:\n{e}\n\n"
+                "Please ensure the file is valid JSON format."
+            )
+            self.set_status_message("Failed to read JSON file")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to scan functions: {e}")
-            self.status_label.config(
-                text=f"Loaded {len(self.z21_data.locomotives)} locomotives")
+            messagebox.showerror("Error", f"Failed to scan functions from JSON: {e}")
+            import traceback
+            traceback.print_exc()
+            self.set_status_message("Failed to scan functions from JSON")
 
     def extract_functions_with_ai(self, image_path: str) -> list:
         """Extract function information from image using AI (OpenAI GPT-4 Vision).
@@ -2608,6 +2787,90 @@ Be accurate and extract all visible functions."""
 
         # Fallback: return first available icon or empty string
         return icon_names[0] if icon_names else ''
+
+    def match_icon_name_to_mapping(self, icon_name: str) -> str:
+        """Match an icon name from JSON to an icon in icon_mapping using best guess.
+        
+        This method tries to find the best matching icon in icon_mapping based on
+        the icon name provided in JSON (e.g., "light", "sound", "horn").
+        
+        Args:
+            icon_name: Icon name from JSON (e.g., "light", "sound", "horn")
+            
+        Returns:
+            Best matching icon name from icon_mapping, or empty string if no match found
+        """
+        if not icon_name:
+            return ''
+        
+        icon_name_lower = icon_name.lower().strip()
+        icon_names = list(self.icon_mapping.keys())
+        
+        # Direct match (case-insensitive)
+        for icon_key in icon_names:
+            if icon_key.lower() == icon_name_lower:
+                return icon_key
+        
+        # Partial match: check if icon_name is contained in any icon_mapping key
+        for icon_key in icon_names:
+            icon_key_lower = icon_key.lower()
+            if icon_name_lower in icon_key_lower or icon_key_lower in icon_name_lower:
+                return icon_key
+        
+        # Keyword-based matching
+        icon_keyword_map = {
+            'light': ['light', 'lamp', 'beam', 'sidelight', 'interior_light', 'cabin_light', 'cycle_light'],
+            'sound': ['sound', 'sound1', 'sound2', 'sound3', 'sound4', 'curve_sound', 'sound_brake'],
+            'horn': ['horn', 'horn_high', 'horn_low', 'horn_two_sound'],
+            'bell': ['bell'],
+            'whistle': ['whistle', 'whistle_long', 'whistle_short'],
+            'couple': ['couple'],
+            'decouple': ['decouple'],
+            'fan': ['fan', 'fan_strong', 'blower'],
+            'compressor': ['compressor'],
+            'pump': ['pump', 'feed_pump', 'air_pump'],
+            'door': ['door', 'door_open', 'door_close'],
+            'brake': ['brake', 'brake_delay', 'handbrake'],
+            'steam': ['steam', 'dump_steam'],
+            'drain': ['drain', 'drainage', 'drain_mud', 'drain_valve'],
+            'diesel': ['diesel', 'diesel_generator', 'diesel_regulation'],
+            'rail': ['rail', 'rail_kick', 'rail_crossing'],
+            'scoop': ['scoop', 'scoop_coal'],
+            'shunting': ['shunting', 'hump_gear'],
+            'generic': ['neutral', 'generic'],
+        }
+        
+        # Try keyword matching
+        for keyword, icon_candidates in icon_keyword_map.items():
+            if keyword in icon_name_lower:
+                # Find best match from candidates
+                for candidate in icon_candidates:
+                    if candidate in icon_names:
+                        return candidate
+                # If no exact match, try partial match
+                for icon_key in icon_names:
+                    for candidate in icon_candidates:
+                        if candidate in icon_key.lower():
+                            return icon_key
+        
+        # Fuzzy matching: find icon names that contain words from icon_name
+        icon_words = set(re.findall(r'\b\w+\b', icon_name_lower))
+        best_match = None
+        best_score = 0
+        
+        for icon_key in icon_names:
+            icon_key_words = set(re.findall(r'\b\w+\b', icon_key.lower()))
+            # Calculate overlap score
+            overlap = len(icon_words & icon_key_words)
+            if overlap > best_score:
+                best_score = overlap
+                best_match = icon_key
+        
+        if best_match and best_score > 0:
+            return best_match
+        
+        # No match found
+        return ''
 
     def save_locomotive_changes(self):
         """Save changes to locomotive details."""
@@ -3975,7 +4238,7 @@ Be accurate and extract all visible functions."""
                           padx=5,
                           pady=(10, 5))
 
-        # Row 1: "Add New Function", "Scan for Functions", and "Save Changes" buttons
+        # Row 1: "Add New Function", "Scan from JSON", and "Save Changes" buttons
         # Always show these buttons even if no functions exist
         button_frame = ttk.Frame(self.functions_frame_inner)
         button_frame.grid(row=1,
@@ -3991,8 +4254,8 @@ Be accurate and extract all visible functions."""
         add_button.pack(side=tk.LEFT, padx=(0, 10))
 
         scan_functions_button = ttk.Button(button_frame,
-                                           text="📷 Scan for Functions",
-                                           command=self.scan_for_functions)
+                                           text="📄 Scan from JSON",
+                                           command=self.scan_from_json)
         scan_functions_button.pack(side=tk.LEFT, padx=(0, 10))
 
         save_button = ttk.Button(button_frame,
@@ -4006,7 +4269,7 @@ Be accurate and extract all visible functions."""
             no_funcs_label = ttk.Label(
                 self.functions_frame_inner,
                 text=
-                "No functions configured. Use 'Add New Function' or 'Scan for Functions' to add functions.",
+                "No functions configured. Use 'Add New Function' or 'Scan from JSON' to add functions.",
                 font=('Arial', 11),
                 foreground='gray')
             no_funcs_label.grid(row=2,
