@@ -36,24 +36,6 @@ except ImportError:
 # Fix OpenMP library conflict on macOS (must be set before importing PaddleOCR)
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-# Allow disabling PaddleOCR via environment variable (useful if it causes crashes)
-DISABLE_PADDLEOCR = os.environ.get("DISABLE_PADDLEOCR", "").lower() in ("1", "true", "yes")
-
-try:
-    if DISABLE_PADDLEOCR:
-        print("PaddleOCR is disabled via DISABLE_PADDLEOCR environment variable")
-        HAS_PADDLEOCR = False
-    else:
-        from paddleocr import PaddleOCR
-        # Try to initialize to check if all dependencies are available
-        HAS_PADDLEOCR = True
-except (ImportError, ModuleNotFoundError) as e:
-    HAS_PADDLEOCR = False
-except Exception as e:
-    print(f"Warning: PaddleOCR import failed: {e}")
-    print("If you see segmentation fault errors, set DISABLE_PADDLEOCR=1 to disable PaddleOCR")
-    HAS_PADDLEOCR = False
-
 # Add project root to path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -72,6 +54,7 @@ class Z21GUI:
         self.z21_data: Optional[Z21File] = None
         self.current_loco: Optional[Locomotive] = None
         self.current_loco_index: Optional[int] = None
+        self.current_filtered_index: Optional[int] = None  # Track selected index in filtered list
         self.original_loco_address: Optional[int] = None
         self.user_selected_loco: Optional[Locomotive] = None
         self.default_icon_path = Path(__file__).parent.parent / "icons" / "neutrals_normal.png"
@@ -115,7 +98,20 @@ class Z21GUI:
     def setup_ui(self):
         """Set up the user interface."""
         self.root.title("Z21 Locomotive Manager")
-        self.root.geometry("1200x800")
+        # Set initial window size and position
+        self.root.update_idletasks()  # Ensure window is ready
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        # Set window width to 80% of screen width (min 1000, max 1600)
+        window_width = max(1000, min(1600, int(screen_width * 0.8)))
+        # Set window height to 75% of screen height (min 600, max 1000)
+        window_height = max(600, min(1000, int(screen_height * 0.75)))
+        # Center the window on screen
+        x = (screen_width - window_width) // 2
+        y = (screen_height - window_height) // 2
+        self.root.geometry(f"{window_width}x{window_height}+{x}+{y}")
+        # Set minimum window size
+        self.root.minsize(800, 500)
 
         # Create main container with resizable paned window
         from tkinter import PanedWindow
@@ -124,7 +120,7 @@ class Z21GUI:
 
         # Left panel: Locomotive list
         left_frame = ctk.CTkFrame(main_paned)
-        main_paned.add(left_frame, minsize=200, width=140)
+        main_paned.add(left_frame, minsize=200, width=340)
 
         # Search box
         search_frame = ctk.CTkFrame(left_frame)
@@ -136,21 +132,16 @@ class Z21GUI:
         search_entry.pack(side="left", fill="x", expand=True, padx=5)
 
         # Button container for New, Delete, and Import buttons
-        button_frame = ctk.CTkFrame(left_frame)
+        button_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
         button_frame.pack(fill="x", padx=5, pady=(0, 5))
         
-        label_spacer = ctk.CTkLabel(button_frame, text="")
-        label_spacer.pack(side="left", padx=5)
-        
-        inner_button_frame = ctk.CTkFrame(button_frame)
-        inner_button_frame.pack(side="left", fill="x", expand=True, padx=0)
-        
+        # Configure columns for equal distribution of 3 buttons
         for i in range(3):
-            inner_button_frame.grid_columnconfigure(i, weight=1, uniform="buttons")
+            button_frame.grid_columnconfigure(i, weight=1, uniform="buttons")
 
-        ctk.CTkButton(inner_button_frame, text="Import", command=self.import_z21_loco).grid(row=0, column=0, padx=5, pady=0, sticky="ew")
-        ctk.CTkButton(inner_button_frame, text="Delete", command=self.delete_selected_locomotive).grid(row=0, column=1, padx=5, pady=0, sticky="ew")
-        ctk.CTkButton(inner_button_frame, text="New", command=self.create_new_locomotive).grid(row=0, column=2, padx=5, pady=0, sticky="ew")
+        ctk.CTkButton(button_frame, text="Import", command=self.import_z21_loco).grid(row=0, column=0, padx=(0, 5), pady=0, sticky="ew")
+        ctk.CTkButton(button_frame, text="Delete", command=self.delete_selected_locomotive).grid(row=0, column=1, padx=(0, 5), pady=0, sticky="ew")
+        ctk.CTkButton(button_frame, text="New", command=self.create_new_locomotive).grid(row=0, column=2, padx=(0, 0), pady=0, sticky="ew")
 
         # Locomotive list
         list_frame = ctk.CTkFrame(left_frame)
@@ -160,6 +151,17 @@ class Z21GUI:
         self.loco_listbox_frame = ctk.CTkScrollableFrame(list_frame)
         self.loco_listbox_frame.pack(fill="both", expand=True)
         self.loco_listbox_buttons = []
+        
+        # Bind keyboard events for navigation
+        self.loco_listbox_frame.bind("<Up>", self.on_arrow_up)
+        self.loco_listbox_frame.bind("<Down>", self.on_arrow_down)
+        self.loco_listbox_frame.bind("<KeyPress-Up>", self.on_arrow_up)
+        self.loco_listbox_frame.bind("<KeyPress-Down>", self.on_arrow_down)
+        # Make the frame focusable
+        self.loco_listbox_frame.bind("<Button-1>", lambda e: self.loco_listbox_frame.focus_set())
+        # Also bind to root for global keyboard navigation
+        self.root.bind("<Up>", lambda e: self.on_arrow_up(e) if self.is_list_focused() else None)
+        self.root.bind("<Down>", lambda e: self.on_arrow_down(e) if self.is_list_focused() else None)
 
         # Status label
         self.status_label = ctk.CTkLabel(left_frame, text="Loading...")
@@ -167,7 +169,7 @@ class Z21GUI:
 
         # Right panel: Details
         right_frame = ctk.CTkFrame(main_paned)
-        main_paned.add(right_frame, minsize=400)
+        main_paned.add(right_frame, minsize=300, width=500)
 
         # Details notebook (tabs)
         self.notebook = ctk.CTkTabview(right_frame)
@@ -189,36 +191,33 @@ class Z21GUI:
         details_frame = ctk.CTkFrame(scrollable_frame)
         details_frame.pack(fill="x", padx=5, pady=5)
 
-        title_label = ctk.CTkLabel(details_frame, text="Locomotive Details", font=ctk.CTkFont(size=14, weight="bold"))
-        title_label.grid(row=0, column=0, columnspan=4, pady=(0, 10))
-
         # Row 0: Image panel
         self.loco_image_label = ctk.CTkLabel(details_frame, text="No Image", anchor="center")
-        self.loco_image_label.grid(row=0, column=1, columnspan=3, padx=(0, 10), pady=5, sticky="ew")
+        self.loco_image_label.grid(row=0, column=1, columnspan=4, padx=(0, 10), pady=5, sticky="ew")
         self.loco_image_label.image = None
         self.loco_image_label.bind("<Button-1>", self.on_image_click)
 
         # Row 1: Name and Address
-        ctk.CTkLabel(details_frame, text="Name:", width=70, anchor="e").grid(row=1, column=0, padx=(5, 9), pady=2, sticky="e")
+        ctk.CTkLabel(details_frame, text="Name:", width=7, anchor="e").grid(row=1, column=0, padx=(5, 9), pady=2, sticky="e")
         self.name_var = ctk.StringVar()
-        self.name_entry = ctk.CTkEntry(details_frame, textvariable=self.name_var, width=20)
+        self.name_entry = ctk.CTkEntry(details_frame, textvariable=self.name_var)
         self.name_entry.grid(row=1, column=1, padx=(1, 3), pady=2, sticky="ew")
 
-        ctk.CTkLabel(details_frame, text="Address:", width=70, anchor="e").grid(row=1, column=1, padx=(3, 1), pady=2, sticky="e")
+        ctk.CTkLabel(details_frame, text="Address:", width=50, anchor="e").grid(row=1, column=2, padx=(3, 1), pady=2, sticky="e")
         self.address_var = ctk.StringVar()
-        self.address_entry = ctk.CTkEntry(details_frame, textvariable=self.address_var, width=70)
-        self.address_entry.grid(row=1, column=2, padx=(1, 5), pady=2, sticky="ew")
+        self.address_entry = ctk.CTkEntry(details_frame, textvariable=self.address_var)
+        self.address_entry.grid(row=1, column=3, padx=(1, 5), pady=2, sticky="ew")
 
         # Row 2: Max Speed and Direction
-        ctk.CTkLabel(details_frame, text="Max Speed:", width=70, anchor="e").grid(row=2, column=0, padx=(5, 9), pady=2, sticky="e")
+        ctk.CTkLabel(details_frame, text="Max Speed:", width=7, anchor="e").grid(row=2, column=0, padx=(5, 9), pady=2, sticky="e")
         self.speed_var = ctk.StringVar()
-        self.speed_entry = ctk.CTkEntry(details_frame, textvariable=self.speed_var, width=20)
+        self.speed_entry = ctk.CTkEntry(details_frame, textvariable=self.speed_var)
         self.speed_entry.grid(row=2, column=1, padx=(1, 3), pady=2, sticky="ew")
 
-        ctk.CTkLabel(details_frame, text="Direction:", width=7, anchor="e").grid(row=2, column=1, padx=(3, 1), pady=2, sticky="e")
+        ctk.CTkLabel(details_frame, text="Direction:", width=50, anchor="e").grid(row=2, column=2, padx=(3, 1), pady=2, sticky="e")
         self.direction_var = ctk.StringVar()
         self.direction_combo = ctk.CTkComboBox(details_frame, variable=self.direction_var, values=["Forward", "Reverse"], state="readonly", width=18)
-        self.direction_combo.grid(row=2, column=2, padx=(1, 5), pady=2, sticky="ew")
+        self.direction_combo.grid(row=2, column=3, padx=(1, 5), pady=2, sticky="ew")
 
         # Additional Information Section
         row = 3
@@ -229,7 +228,7 @@ class Z21GUI:
         ctk.CTkLabel(details_frame, text="Full Name:", width=7, anchor="e").grid(row=row, column=0, padx=(5, 1), pady=2, sticky="e")
         self.full_name_var = ctk.StringVar()
         self.full_name_entry = ctk.CTkEntry(details_frame, textvariable=self.full_name_var, width=28)
-        self.full_name_entry.grid(row=row, column=1, columnspan=2, padx=(1, 5), pady=2, sticky="ew")
+        self.full_name_entry.grid(row=row, column=1, columnspan=4, padx=(1, 5), pady=2, sticky="ew")
         row += 1
 
         # Detailed fields
@@ -244,82 +243,103 @@ class Z21GUI:
         for label1, var1, label2, var2 in fields:
             ctk.CTkLabel(details_frame, text=label1, width=7, anchor="e").grid(row=row, column=0, padx=(5, 1), pady=2, sticky="e")
             setattr(self, var1, ctk.StringVar())
-            ctk.CTkEntry(details_frame, textvariable=getattr(self, var1), width=20).grid(row=row, column=1, padx=(1, 3), pady=2, sticky="ew")
+            ctk.CTkEntry(details_frame, textvariable=getattr(self, var1)).grid(row=row, column=1, padx=(1, 3), pady=2, sticky="ew")
             
-            ctk.CTkLabel(details_frame, text=label2, width=7, anchor="e").grid(row=row, column=1, padx=(3, 1), pady=2, sticky="e")
+            ctk.CTkLabel(details_frame, text=label2, width=7, anchor="e").grid(row=row, column=2, padx=(3, 1), pady=2, sticky="e")
             setattr(self, var2, ctk.StringVar())
-            ctk.CTkEntry(details_frame, textvariable=getattr(self, var2), width=7).grid(row=row, column=2, padx=(1, 5), pady=2, sticky="ew")
+            ctk.CTkEntry(details_frame, textvariable=getattr(self, var2)).grid(row=row, column=3, padx=(1, 5), pady=2, sticky="ew")
             row += 1
 
         # Checkboxes and Speed Display
         checkbox_frame = ctk.CTkFrame(details_frame, fg_color="transparent")
-        checkbox_frame.grid(row=row, column=1, sticky="w", padx=(1, 3), pady=2)
+        checkbox_frame.grid(row=row, column=1, sticky="ew", padx=(1, 3), pady=2)
         
         self.active_var = ctk.BooleanVar()
         self.active_checkbox = ctk.CTkCheckBox(checkbox_frame, text="Active", variable=self.active_var)
-        self.active_checkbox.pack(side="left", padx=(0, 60))
+        self.active_checkbox.pack(side="left", padx=(0, 5))
         
         self.crane_var = ctk.BooleanVar()
         self.crane_checkbox = ctk.CTkCheckBox(checkbox_frame, text="Crane", variable=self.crane_var)
-        self.crane_checkbox.pack(side="left")
+        self.crane_checkbox.pack(side="right")
 
-        ctk.CTkLabel(details_frame, text="Speed Display:", width=7, anchor="e").grid(row=row, column=1, padx=(3, 1), pady=2, sticky="e")
+        ctk.CTkLabel(details_frame, text="Speed Display:", width=7, anchor="e").grid(row=row, column=2, padx=(3, 1), pady=2, sticky="e")
         self.speed_display_var = ctk.StringVar()
         self.speed_display_combo = ctk.CTkComboBox(details_frame, variable=self.speed_display_var, values=["km/h", "Regulation Step", "mph"], state="readonly", width=7)
-        self.speed_display_combo.grid(row=row, column=2, padx=(1, 5), pady=2, sticky="ew")
+        self.speed_display_combo.grid(row=row, column=3, padx=(1, 5), pady=2, sticky="ew")
         row += 1
 
         # Vehicle Type and Reg Step
         ctk.CTkLabel(details_frame, text="Vehicle Type:", width=7, anchor="e").grid(row=row, column=0, padx=(5, 1), pady=2, sticky="e")
         self.rail_vehicle_type_var = ctk.StringVar()
-        self.rail_vehicle_type_combo = ctk.CTkComboBox(details_frame, variable=self.rail_vehicle_type_var, values=["Loco", "Wagon", "Accessory"], state="readonly", width=20)
+        self.rail_vehicle_type_combo = ctk.CTkComboBox(details_frame, variable=self.rail_vehicle_type_var, values=["Loco", "Wagon", "Accessory"], state="readonly", width=180)
         self.rail_vehicle_type_combo.grid(row=row, column=1, padx=(1, 3), pady=2, sticky="ew")
 
-        ctk.CTkLabel(details_frame, text="Reg Step:", width=7, anchor="e").grid(row=row, column=1, padx=(3, 1), pady=2, sticky="e")
+        ctk.CTkLabel(details_frame, text="Reg Step:", width=7, anchor="e").grid(row=row, column=2, padx=(3, 1), pady=2, sticky="e")
         self.regulation_step_var = ctk.StringVar()
         self.regulation_step_combo = ctk.CTkComboBox(details_frame, variable=self.regulation_step_var, values=["128", "28", "14"], state="readonly", width=7)
-        self.regulation_step_combo.grid(row=row, column=2, padx=(1, 5), pady=2, sticky="ew")
+        self.regulation_step_combo.grid(row=row, column=3, padx=(1, 5), pady=2, sticky="ew")
         row += 1
 
         # Categories and In Stock Since
         ctk.CTkLabel(details_frame, text="Categories:", width=7, anchor="e").grid(row=row, column=0, padx=(5, 1), pady=2, sticky="e")
         self.categories_var = ctk.StringVar()
-        self.categories_entry = ctk.CTkEntry(details_frame, textvariable=self.categories_var, width=20)
+        self.categories_entry = ctk.CTkEntry(details_frame, textvariable=self.categories_var)
         self.categories_entry.grid(row=row, column=1, padx=(1, 3), pady=2, sticky="ew")
 
-        ctk.CTkLabel(details_frame, text="In Stock Since:", width=7, anchor="e").grid(row=row, column=1, padx=(3, 1), pady=2, sticky="e")
+        ctk.CTkLabel(details_frame, text="In Stock Since:", width=7, anchor="e").grid(row=row, column=2, padx=(3, 1), pady=2, sticky="e")
         self.in_stock_since_var = ctk.StringVar()
         self.in_stock_since_entry = ctk.CTkEntry(details_frame, textvariable=self.in_stock_since_var, width=7)
-        self.in_stock_since_entry.grid(row=row, column=2, padx=(1, 5), pady=2, sticky="ew")
+        self.in_stock_since_entry.grid(row=row, column=3, padx=(1, 5), pady=2, sticky="ew")
         row += 1
 
         # Description field
-        ctk.CTkLabel(details_frame, text="Description:", width=7, anchor="ne").grid(row=row, column=0, padx=(5, 1), pady=2, sticky="ne")
+        ctk.CTkLabel(details_frame, text="Description: ", width=7, anchor="e").grid(row=row, column=0, padx=(5, 1), pady=2, sticky="ne")
         self.description_text = ctk.CTkTextbox(details_frame, wrap="word", width=350, height=200, font=ctk.CTkFont(size=11))
-        self.description_text.grid(row=row, column=1, columnspan=2, padx=(1, 5), pady=2, sticky="ew")
+        self.description_text.grid(row=row, column=1, columnspan=3, padx=(1, 5), pady=2, sticky="ew")
         row += 1
 
         details_frame.grid_columnconfigure(0, weight=0)
-        details_frame.grid_columnconfigure(1, weight=1)
-        details_frame.grid_columnconfigure(2, weight=1)
+        details_frame.grid_columnconfigure(1, weight=1,uniform="input_group")
+        details_frame.grid_columnconfigure(2, weight=0)
+        details_frame.grid_columnconfigure(3, weight=1,uniform="input_group")
 
-        # Action buttons
-        button_frame = ctk.CTkFrame(scrollable_frame)
-        button_frame.pack(fill="x", padx=5, pady=5)
-        self.export_button = ctk.CTkButton(button_frame, text="Export Z21 Loco", command=self.export_z21_loco)
-        self.export_button.pack(side="left", padx=5)
-        self.share_button = ctk.CTkButton(button_frame, text="Share with WIFI", command=self.share_with_airdrop)
-        self.share_button.pack(side="left", padx=5)
-        self.scan_button = ctk.CTkButton(button_frame, text="Scan for Details", command=self.scan_for_details)
-        self.scan_button.pack(side="right", padx=5)
-        self.save_button = ctk.CTkButton(button_frame, text="Save Changes", command=self.save_locomotive_changes)
-        self.save_button.pack(side="right", padx=5)
+        # Action buttons - all in one row, evenly distributed in columns 1-3
+        button_row = row
+        # Create a button container that spans columns 1-3
+        button_container = ctk.CTkFrame(details_frame, fg_color="transparent")
+        button_container.grid(row=button_row, column=1, columnspan=3, padx=(1, 5), pady=5, sticky="ew")
+        
+        # Configure button container columns for equal distribution of 4 buttons
+        for i in range(4):
+            button_container.grid_columnconfigure(i, weight=1, uniform="buttons")
+        
+        self.export_button = ctk.CTkButton(
+            button_container, text="Export Z21 Loco", command=self.export_z21_loco
+        )
+        self.export_button.grid(row=0, column=0, padx=(0, 5), pady=0, sticky="ew")
+        
+        self.share_button = ctk.CTkButton(
+            button_container, text="Share with WIFI", command=self.share_with_airdrop
+        )
+        self.share_button.grid(row=0, column=1, padx=(0, 5), pady=0, sticky="ew")
+        
+        self.scan_button = ctk.CTkButton(
+            button_container, text="Scan for Details", command=self.scan_for_details
+        )
+        self.scan_button.grid(row=0, column=2, padx=(0, 5), pady=0, sticky="ew")
+        
+        self.save_button = ctk.CTkButton(
+            button_container, text="Save Changes", command=self.save_locomotive_changes
+        )
+        self.save_button.grid(row=0, column=3, padx=(0, 0), pady=0, sticky="ew")
+        row = button_row + 1
 
-        # Overview text area
-        text_frame = ctk.CTkFrame(scrollable_frame)
-        text_frame.pack(fill="both", expand=True, padx=5, pady=5)
-        self.overview_text = ctk.CTkTextbox(text_frame, wrap="word", font=ctk.CTkFont(family="Courier", size=12), state="disabled")
-        self.overview_text.pack(fill="both", expand=True)
+        # Overview text area - fills columns 1-3
+        self.overview_text = ctk.CTkTextbox(details_frame, wrap="word", font=ctk.CTkFont(family="Courier", size=12), state="disabled")
+        self.overview_text.grid(row=row, column=1, columnspan=3, padx=(1, 5), pady=5, sticky="nsew")
+        
+        # Configure row weight for overview text area to expand
+        details_frame.grid_rowconfigure(row, weight=1)
 
         # Mousewheel binding logic
         def on_overview_mousewheel(event):
@@ -412,6 +432,7 @@ class Z21GUI:
                     self.loco_listbox_frame,
                     text=display_text,
                     anchor="w",
+                    text_color="black",
                     command=lambda idx=len(self.filtered_locos): self.on_loco_button_click(idx),
                 )
                 button.pack(fill="x", padx=5, pady=2)
@@ -426,23 +447,110 @@ class Z21GUI:
                         break
 
         if current_selection is not None:
+            self.current_filtered_index = current_selection
             self.highlight_button(current_selection)
             self.on_loco_select_by_index(current_selection)
         elif self.filtered_locos and auto_select_first:
+            self.current_filtered_index = 0
             self.highlight_button(0)
             self.on_loco_select_by_index(0)
 
+    def scroll_button_into_view(self, index: int):
+        """Scroll the button at the given index into view if it's outside the visible area."""
+        if index < 0 or index >= len(self.loco_listbox_buttons):
+            return
+        try:
+            button = self.loco_listbox_buttons[index]
+            self.root.update_idletasks()
+            
+            # Get the internal canvas of CTkScrollableFrame
+            canvas = self.loco_listbox_frame._parent_canvas
+            
+            # Get button position relative to the scrollable frame
+            button.update_idletasks()
+            button_y = button.winfo_y()
+            button_height = button.winfo_height()
+            button_bottom = button_y + button_height
+            
+            # Get canvas dimensions
+            canvas.update_idletasks()
+            canvas_height = canvas.winfo_height()
+            
+            # Get current view position
+            view_top_ratio, view_bottom_ratio = canvas.yview()
+            
+            # Get total scrollable height
+            bbox = canvas.bbox("all")
+            if not bbox:
+                return
+            total_height = max(bbox[3] - bbox[1], 1)
+            
+            # Calculate current visible area in pixels
+            view_top_px = view_top_ratio * total_height
+            view_bottom_px = view_bottom_ratio * total_height
+            
+            # Check if button is outside visible area and scroll if needed
+            if button_y < view_top_px:
+                # Button is above visible area, scroll up
+                target_ratio = max(0.0, button_y / total_height)
+                canvas.yview_moveto(target_ratio)
+            elif button_bottom > view_bottom_px:
+                # Button is below visible area, scroll down
+                # Show button at the bottom of visible area
+                target_ratio = max(0.0, min(1.0, (button_bottom - canvas_height) / total_height))
+                canvas.yview_moveto(target_ratio)
+        except Exception:
+            pass  # Ignore scroll errors
+
     def highlight_button(self, index: int):
         """Highlight a button at the given index."""
+        if index < 0 or index >= len(self.loco_listbox_buttons):
+            return
         for i, button in enumerate(self.loco_listbox_buttons):
             if i == index:
-                button.configure(fg_color=("gray75", "gray25"))
+                button.configure(fg_color=("gray60", "gray40"))  # Darker color for selected
             else:
-                button.configure(fg_color=("gray80", "gray20"))
+                button.configure(fg_color=("gray85", "gray18"))  # Lighter color for unselected
+        self.current_filtered_index = index
+        # Scroll the button into view if it's outside visible area
+        self.scroll_button_into_view(index)
 
     def on_loco_button_click(self, index: int):
         self.highlight_button(index)
         self.on_loco_select_by_index(index)
+        # Focus the list frame for keyboard navigation
+        self.loco_listbox_frame.focus_set()
+    
+    def is_list_focused(self):
+        """Check if the locomotive list has focus."""
+        try:
+            return self.loco_listbox_frame.focus_get() == self.loco_listbox_frame
+        except:
+            return False
+    
+    def on_arrow_up(self, event):
+        """Handle up arrow key to navigate to previous locomotive."""
+        if not self.filtered_locos:
+            return
+        if self.current_filtered_index is None:
+            self.current_filtered_index = 0
+        else:
+            self.current_filtered_index = max(0, self.current_filtered_index - 1)
+        self.highlight_button(self.current_filtered_index)
+        self.on_loco_select_by_index(self.current_filtered_index)
+        return "break"
+    
+    def on_arrow_down(self, event):
+        """Handle down arrow key to navigate to next locomotive."""
+        if not self.filtered_locos:
+            return
+        if self.current_filtered_index is None:
+            self.current_filtered_index = 0
+        else:
+            self.current_filtered_index = min(len(self.filtered_locos) - 1, self.current_filtered_index + 1)
+        self.highlight_button(self.current_filtered_index)
+        self.on_loco_select_by_index(self.current_filtered_index)
+        return "break"
 
     def on_loco_select_by_index(self, index: int):
         """Handle locomotive selection by index."""
