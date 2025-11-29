@@ -63,6 +63,9 @@ class Z21GUI:
         self.status_timeout_id = None
         self.default_status_text = "Loading..."
         self._mouse_over_function_icon = False
+        self.selected_function_num = None  # Track selected function icon
+        self.delete_function_button = None  # Reference to delete button
+        self.function_card_frames = {}  # Store card frames for selection highlighting
         self.setup_ui()
         self.load_data()
 
@@ -112,6 +115,12 @@ class Z21GUI:
         self.root.geometry(f"{window_width}x{window_height}+{x}+{y}")
         # Set minimum window size
         self.root.minsize(800, 500)
+        
+        # Track window resize for function layout recalculation
+        self._resize_timeout_id = None
+        self._last_window_width = None
+        self._last_window_height = None
+        self.root.bind("<Configure>", self.on_window_resize)
 
         # Create main container with resizable paned window
         from tkinter import PanedWindow
@@ -439,12 +448,12 @@ class Z21GUI:
                 self.loco_listbox_buttons.append(button)
                 self.filtered_locos.append(loco)
 
-        if preserve_selection and current_loco and self.user_selected_loco:
-            if current_loco.address == self.user_selected_loco.address and current_loco.name == self.user_selected_loco.name:
-                for i, loco in enumerate(self.filtered_locos):
-                    if loco.address == self.user_selected_loco.address and loco.name == self.user_selected_loco.name:
-                        current_selection = i
-                        break
+        if preserve_selection and self.user_selected_loco:
+            # Try to find the selected locomotive in the filtered list
+            for i, loco in enumerate(self.filtered_locos):
+                if loco.address == self.user_selected_loco.address and loco.name == self.user_selected_loco.name:
+                    current_selection = i
+                    break
 
         if current_selection is not None:
             self.current_filtered_index = current_selection
@@ -628,12 +637,28 @@ class Z21GUI:
 
         try:
             if self.current_loco_index is not None and self.current_loco_index < len(self.z21_data.locomotives):
-                deleted_loco = self.z21_data.locomotives.pop(self.current_loco_index)
+                deleted_index = self.current_loco_index
+                deleted_loco = self.z21_data.locomotives.pop(deleted_index)
+                
+                # Determine which locomotive to select after deletion
+                new_selection_loco = None
+                if len(self.z21_data.locomotives) > 0:
+                    if deleted_index > 0:
+                        # Select the previous locomotive (now at deleted_index - 1)
+                        new_selection_loco = self.z21_data.locomotives[deleted_index - 1]
+                    else:
+                        # Select the next locomotive (now at index 0, which was index 1 before)
+                        new_selection_loco = self.z21_data.locomotives[0]
+                
                 self.current_loco = None
                 self.current_loco_index = None
                 self.original_loco_address = None
+                self.user_selected_loco = new_selection_loco
                 self.update_details()
-                self.populate_list(self.search_var.get() if hasattr(self, "search_var") else "", preserve_selection=True)
+                
+                # Refresh list and select the new locomotive if one was chosen
+                filter_text = self.search_var.get() if hasattr(self, "search_var") else ""
+                self.populate_list(filter_text, preserve_selection=(new_selection_loco is not None), auto_select_first=False)
 
                 try:
                     self.parser.write(self.z21_data, self.z21_file)
@@ -916,17 +941,69 @@ class Z21GUI:
         self.description_text.delete(1.0, "end")
         self.description_text.insert(1.0, loco.description)
 
+        # Safely update image label with comprehensive error handling
+        def safe_clear_image(label):
+            """Safely clear image from label by accessing internal label directly."""
+            try:
+                # Clear our image reference
+                if hasattr(label, 'image'):
+                    label.image = None
+                # Clear internal Tkinter label image directly
+                try:
+                    label._label.configure(image="")
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        
+        def safe_configure_label(label, **kwargs):
+            """Safely configure label, ignoring any image-related errors."""
+            # First, always try to clear image before configuring
+            if 'image' not in kwargs or kwargs.get('image') is None:
+                safe_clear_image(label)
+            
+            try:
+                label.configure(**kwargs)
+            except Exception:
+                # If configure fails, try to set only text via internal label
+                if 'text' in kwargs:
+                    try:
+                        safe_clear_image(label)
+                        label._text = kwargs['text']
+                        if hasattr(label, '_draw'):
+                            label._draw()
+                    except Exception:
+                        pass
+        
+        # Clear previous image reference and internal label image
+        safe_clear_image(self.loco_image_label)
+        
+        # Now safely set new image or text
         if loco.image_name:
             loco_image = self.load_locomotive_image(loco.image_name, size=(227, 94))
             if loco_image:
-                self.loco_image_label.configure(image=loco_image, text="")
-                self.loco_image_label.image = loco_image
+                try:
+                    safe_configure_label(self.loco_image_label, image=loco_image, text="")
+                    self.loco_image_label.image = loco_image
+                except Exception:
+                    # If setting image fails, just set text
+                    try:
+                        self.loco_image_label.image = None
+                        safe_configure_label(self.loco_image_label, text=f"Image:\n{loco.image_name}")
+                    except Exception:
+                        pass
             else:
-                self.loco_image_label.image = None
-                self.loco_image_label.configure(image="", text=f"Image:\n{loco.image_name}")
+                try:
+                    self.loco_image_label.image = None
+                    safe_configure_label(self.loco_image_label, text=f"Image:\n{loco.image_name}")
+                except Exception:
+                    pass
         else:
-            self.loco_image_label.configure(image="", text="No Image")
-            self.loco_image_label.image = None
+            try:
+                self.loco_image_label.image = None
+                safe_configure_label(self.loco_image_label, text="No Image")
+            except Exception:
+                pass
 
         self.overview_text.configure(state="normal")
         self.overview_text.delete(1.0, "end")
@@ -1794,56 +1871,281 @@ Function Details:  {len(loco.function_details)} available
         except Exception as e:
             messagebox.showerror("Import Error", f"Failed to import locomotive: {e}")
 
-    def update_functions(self):
+    def update_functions(self, is_resize=False):
         """Update functions tab."""
         loco = self.current_loco
         for widget in self.functions_frame_inner.winfo_children():
             widget.destroy()
 
-        if hasattr(self, "_cached_canvas_width"): current_canvas_width = self._cached_canvas_width
+        # Get width from parent frame (functions_frame) which is more reliable
+        # CTkScrollableFrame's winfo_width() may return 1 before it's fully rendered
+        self.root.update_idletasks()
+        self.functions_frame.update_idletasks()
+        
+        # Check if this is the first call (no cached width) or a resize call
+        is_first_call = not hasattr(self, "_cached_canvas_width") or self._cached_canvas_width <= 100
+        
+        if hasattr(self, "_cached_canvas_width") and self._cached_canvas_width > 100:
+            current_canvas_width = self._cached_canvas_width
         else:
-            self.functions_frame_inner.update_idletasks()
-            current_canvas_width = self.functions_frame_inner.winfo_width() or 800
+            # Try getting width from parent frame first (most reliable)
+            current_canvas_width = self.functions_frame.winfo_width()
+            
+            # If parent frame width is not available or too small, try other methods
+            if current_canvas_width <= 100:
+                # Try internal canvas of scrollable frame
+                try:
+                    canvas = self.functions_frame_inner._parent_canvas
+                    canvas.update_idletasks()
+                    canvas_width = canvas.winfo_width()
+                    if canvas_width > 100:
+                        current_canvas_width = canvas_width
+                except:
+                    pass
+            
+            # If still not available, calculate from root window width
+            if current_canvas_width <= 100:
+                root_width = self.root.winfo_width()
+                if root_width > 100:
+                    # Approximate: root width - left panel (about 300) - notebook padding (about 20)
+                    current_canvas_width = max(400, root_width - 320)
+                else:
+                    current_canvas_width = 800  # Fallback default
+            
+            # Ensure minimum reasonable width for function cards
+            if current_canvas_width < 400:
+                current_canvas_width = 800  # Reasonable default
 
-        card_width = 100
-        cols = max(1, (current_canvas_width - 40) // card_width)
+        # Card width including padding (100px card + 10px padding on each side = 110px per column)
+        card_width_with_padding = 110
+        # Add 1 extra column only for resize calls, not for first call
+        base_cols = (current_canvas_width - 40) // card_width_with_padding
+        if is_resize or not is_first_call:
+            cols = max(1, base_cols + 1)  # Add 1 extra column for resize or subsequent calls
+        else:
+            cols = max(1, base_cols)  # First call: use base calculation without extra column
+        # Debug output (remove in production if needed)
+        if current_canvas_width < 100:
+            print(f"Warning: Width is {current_canvas_width}, using fallback. Root width: {self.root.winfo_width()}, Functions frame width: {self.functions_frame.winfo_width()}")
         
         self._cached_canvas_width = current_canvas_width
         self._cached_cols = cols
+        
+        # If width was too small, schedule a recalculation after window is fully rendered
+        if current_canvas_width < 400 and not hasattr(self, "_width_recalc_scheduled"):
+            self._width_recalc_scheduled = True
+            self.root.after(100, self.recalculate_function_layout)
 
         header_label = ctk.CTkLabel(self.functions_frame_inner, text=f"Functions for {loco.name}", font=("Arial", 14, "bold"), anchor="w")
         header_label.grid(row=0, column=0, columnspan=cols, sticky="w", padx=5, pady=(10, 5))
 
         button_frame = ctk.CTkFrame(self.functions_frame_inner, fg_color="transparent")
         button_frame.grid(row=1, column=0, columnspan=cols, sticky="ew", padx=5, pady=(0, 10))
+        self.functions_button_frame = button_frame  # Store reference for delete button placement
         ctk.CTkButton(button_frame, text="+ Add New Function", command=self.add_new_function).pack(side="left", padx=(0, 10))
         ctk.CTkButton(button_frame, text="📄 Scan from JSON", command=self.scan_from_json).pack(side="left", padx=(0, 10))
         ctk.CTkButton(button_frame, text="💾 Save Changes", command=self.save_function_changes).pack(side="left")
 
         if not loco.function_details:
-            ctk.CTkLabel(self.functions_frame_inner, text="No functions configured.", font=("Arial", 11), foreground="gray").grid(row=2, column=0, columnspan=cols, sticky="ew", padx=5, pady=20)
+            ctk.CTkLabel(self.functions_frame_inner, text="No functions configured.", font=("Arial", 11), text_color="gray").grid(row=2, column=0, columnspan=cols, sticky="ew", padx=5, pady=20)
             return
 
-        sorted_funcs = sorted(loco.function_details.items(), key=lambda x: x[1].function_number)
+        # Clear previous selection and delete button
+        self.selected_function_num = None
+        self.function_card_frames = {}
+        if self.delete_function_button:
+            self.delete_function_button.destroy()
+            self.delete_function_button = None
+        
+        # Sort by position, then by function number (same as list_locomotives.py)
+        sorted_funcs = sorted(loco.function_details.items(), key=lambda x: (x[1].position, x[1].function_number))
         row, col = 2, 0
         for func_num, func_info in sorted_funcs:
             card_frame = self.create_function_card(func_num, func_info)
+            self.function_card_frames[func_num] = card_frame  # Store reference for selection highlighting
             
-            def make_clickable(widget, fn, fi):
-                widget.bind("<Button-1>", lambda e, fnum=fn, finfo=fi: self.edit_function(fnum, finfo))
-                widget.bind("<Enter>", lambda e: setattr(self, '_mouse_over_function_icon', True))
-                widget.bind("<Leave>", lambda e: self.root.after(100, lambda: setattr(self, '_mouse_over_function_icon', False)))
-                for child in widget.winfo_children(): make_clickable(child, fn, fi)
+            def make_clickable(widget, fn, fi, card_ref):
+                widget._click_pending = False
+                
+                def on_single_click(e):
+                    # Mark that a click is pending
+                    widget._click_pending = True
+                    # Wait to see if it's a double-click (delay to allow double-click detection)
+                    def do_select():
+                        if widget._click_pending:
+                            widget._click_pending = False
+                            self.select_function(fn)
+                    widget.after(300, do_select)
+                
+                def on_double_click(e):
+                    # Cancel pending single click
+                    widget._click_pending = False
+                    # Double click: open edit window
+                    self.edit_function(fn, fi)
+                
+                def on_enter(e):
+                    setattr(self, '_mouse_over_function_icon', True)
+                    widget.configure(cursor="hand2")
+                
+                def on_leave(e):
+                    self.root.after(100, lambda: setattr(self, '_mouse_over_function_icon', False))
+                    widget.configure(cursor="")
+                
+                widget.bind("<Button-1>", on_single_click)
+                widget.bind("<Double-Button-1>", on_double_click)
+                widget.bind("<Enter>", on_enter)
+                widget.bind("<Leave>", on_leave)
+                
+                for child in widget.winfo_children(): 
+                    make_clickable(child, fn, fi, card_ref)
+                    child._click_pending = False
+                    child.bind("<Button-1>", on_single_click)
+                    child.bind("<Double-Button-1>", on_double_click)
+                    child.bind("<Enter>", lambda e, w=widget: w.configure(cursor="hand2"))
+                    child.bind("<Leave>", lambda e, w=widget: w.configure(cursor=""))
             
-            make_clickable(card_frame, func_num, func_info)
+            make_clickable(card_frame, func_num, func_info, card_frame)
             card_frame.grid(row=row, column=col, padx=5, pady=5, sticky="nw")
             col += 1
             if col >= cols:
                 col = 0
                 row += 1
 
+        # Configure grid columns for proper horizontal layout - ensure columns are properly sized
         for i in range(cols):
-            self.functions_frame_inner.grid_columnconfigure(i, weight=0, uniform="card")
+            self.functions_frame_inner.grid_columnconfigure(i, weight=0, minsize=100)
+
+    def select_function(self, func_num: int):
+        """Select a function icon and show delete button."""
+        # Clear previous selection visual feedback
+        if self.selected_function_num is not None and self.selected_function_num in self.function_card_frames:
+            prev_card = self.function_card_frames[self.selected_function_num]
+            prev_card.configure(border_width=2, border_color=("gray75", "gray25"))
+        
+        # Set new selection
+        self.selected_function_num = func_num
+        
+        # Add visual feedback for selected card
+        if func_num in self.function_card_frames:
+            selected_card = self.function_card_frames[func_num]
+            selected_card.configure(border_width=3, border_color=("blue", "light blue"))
+        
+        # Show or update delete button
+        self.show_delete_button(func_num)
+
+    def show_delete_button(self, func_num: int):
+        """Show delete button for selected function."""
+        # Remove existing delete button if any
+        if self.delete_function_button:
+            self.delete_function_button.destroy()
+            self.delete_function_button = None
+        
+        # Create delete button in the button frame
+        if hasattr(self, 'functions_button_frame'):
+            self.delete_function_button = ctk.CTkButton(
+                self.functions_button_frame, 
+                text="🗑️ Delete F" + str(func_num), 
+                command=lambda: self.delete_function(func_num),
+                fg_color=("red4", "darkred"),
+                hover_color=("red3", "red")
+            )
+            self.delete_function_button.pack(side="left", padx=(10, 0))
+
+    def delete_function(self, func_num: int):
+        """Delete the selected function."""
+        if not self.current_loco:
+            return
+        
+        if func_num not in self.current_loco.function_details:
+            return
+        
+        # Confirm deletion
+        func_info = self.current_loco.function_details[func_num]
+        confirm_msg = f"Delete function F{func_num} ({func_info.image_name})?"
+        confirmed = messagebox.askyesno("Confirm Delete", confirm_msg)
+        # Return focus to main window after dialog closes
+        self.root.focus_set()
+        self.root.lift()
+        if not confirmed:
+            return
+        
+        # Delete function
+        if func_num in self.current_loco.function_details:
+            del self.current_loco.function_details[func_num]
+        if func_num in self.current_loco.functions:
+            del self.current_loco.functions[func_num]
+        
+        # Clear selection
+        self.selected_function_num = None
+        if self.delete_function_button:
+            self.delete_function_button.destroy()
+            self.delete_function_button = None
+        
+        # Refresh functions display
+        self.update_functions()
+        self.update_overview()
+        # Switch focus back to Functions tab and return focus to main window
+        if hasattr(self, 'notebook'):
+            self.notebook.set("Functions")
+        # Return focus to main window after deletion
+        self.root.focus_set()
+        self.root.lift()
+        self.root.update()
+        self.set_status_message(f"Function F{func_num} deleted successfully!")
+
+    def recalculate_function_layout(self):
+        """Recalculate function layout after window is fully rendered."""
+        if hasattr(self, "_width_recalc_scheduled"):
+            delattr(self, "_width_recalc_scheduled")
+        # Force recalculation by clearing cache
+        if hasattr(self, "_cached_canvas_width"):
+            delattr(self, "_cached_canvas_width")
+        if hasattr(self, "_cached_cols"):
+            delattr(self, "_cached_cols")
+        # Re-update functions to get correct layout
+        if self.current_loco:
+            self.update_functions()
+
+    def on_window_resize(self, event):
+        """Handle window resize events to recalculate function icon layout."""
+        # Only handle root window resize events, not child widget events
+        if event.widget != self.root:
+            return
+        
+        # Check if window size actually changed
+        current_width = self.root.winfo_width()
+        current_height = self.root.winfo_height()
+        
+        # Ignore if size hasn't changed (might be just window movement)
+        if (hasattr(self, "_last_window_width") and 
+            hasattr(self, "_last_window_height") and
+            self._last_window_width == current_width and
+            self._last_window_height == current_height):
+            return
+        
+        # Update stored dimensions
+        self._last_window_width = current_width
+        self._last_window_height = current_height
+        
+        # Clear cached width so layout will recalculate
+        if hasattr(self, "_cached_canvas_width"):
+            delattr(self, "_cached_canvas_width")
+        if hasattr(self, "_cached_cols"):
+            delattr(self, "_cached_cols")
+        
+        # Use debouncing to avoid too frequent recalculations
+        if hasattr(self, "_resize_timeout_id") and self._resize_timeout_id:
+            self.root.after_cancel(self._resize_timeout_id)
+        
+        # Schedule recalculation after a short delay (debounce)
+        self._resize_timeout_id = self.root.after(200, self._handle_resize_recalculation)
+    
+    def _handle_resize_recalculation(self):
+        """Handle the actual recalculation after resize debounce delay."""
+        self._resize_timeout_id = None
+        # Only recalculate if we're on Functions tab and have a current locomotive
+        if hasattr(self, 'notebook') and self.notebook.get() == "Functions" and self.current_loco:
+            self.update_functions(is_resize=True)  # Mark as resize call to add extra column
 
     def save_function_changes(self):
         """Save all function changes to the Z21 file."""
@@ -1895,36 +2197,150 @@ Function Details:  {len(loco.function_details)} available
         dialog.transient(self.root)
         dialog.grab_set()
 
-        icon_var = ctk.StringVar()
+        icon_var = ctk.StringVar(value="neutral")  # Set default icon to neutral
         func_num_var = ctk.StringVar(value=str(self.get_next_unused_function_number()))
         shortcut_var = ctk.StringVar()
         button_type_var = ctk.StringVar(value="switch")
         time_var = ctk.StringVar(value="1.0")
 
-        main_frame = ctk.CTkFrame(dialog, padding=15)
-        main_frame.pack(fill="both", expand=True)
+        main_frame = ctk.CTkFrame(dialog)
+        main_frame.pack(fill="both", expand=True, padx=15, pady=15)
 
         preview_frame = ctk.CTkFrame(main_frame)
         preview_frame.pack(fill="x", pady=(0, 15))
-        icon_preview_label = ctk.CTkLabel(preview_frame, fg_color="white", border_width=2)
-        icon_preview_label.pack()
+        
+        # Icon Preview Label with initial size
+        icon_preview_label = ctk.CTkLabel(preview_frame, text="Icon Preview", fg_color="white", width=80, height=80)
+        icon_preview_label.pack(pady=5)
 
         def update_icon_preview(*args):
             icon_name = icon_var.get()
             if icon_name:
                 preview_image = self.load_icon_image(icon_name, (80, 80))
                 if preview_image:
-                    icon_preview_label.configure(image=preview_image)
+                    icon_preview_label.configure(image=preview_image, text="")
                     icon_preview_label.image = preview_image
+                else:
+                    icon_preview_label.configure(image=None, text="No icon found")
+                    icon_preview_label.image = None
             else:
-                icon_preview_label.configure(image="", width=80, height=80)
+                icon_preview_label.configure(image=None, text="Icon Preview")
+                icon_preview_label.image = None
         icon_var.trace("w", update_icon_preview)
 
         form_frame = ctk.CTkFrame(main_frame)
         form_frame.pack(fill="both", expand=True)
+
+        # Function Number
+        ctk.CTkLabel(form_frame, text="Function Number:").grid(row=0, column=0, padx=10, pady=5, sticky="w")
+        func_num_entry = ctk.CTkEntry(form_frame, textvariable=func_num_var, width=100)
+        func_num_entry.grid(row=0, column=1, padx=10, pady=5, sticky="w")
+
+        # Icon Selection
+        ctk.CTkLabel(form_frame, text="Icon:").grid(row=1, column=0, padx=10, pady=5, sticky="w")
+        available_icons = self.get_available_icons()
+        icon_combo = ctk.CTkComboBox(form_frame, variable=icon_var, values=available_icons, width=200)
+        icon_combo.grid(row=1, column=1, padx=10, pady=5, sticky="w")
+
+        # Shortcut with Guess button
+        ctk.CTkLabel(form_frame, text="Shortcut:").grid(row=2, column=0, padx=10, pady=5, sticky="w")
+        shortcut_frame = ctk.CTkFrame(form_frame, fg_color="transparent")
+        shortcut_frame.grid(row=2, column=1, padx=10, pady=5, sticky="w")
+        shortcut_entry = ctk.CTkEntry(shortcut_frame, textvariable=shortcut_var, width=100)
+        shortcut_entry.pack(side="left", padx=(0, 5))
         
-        # ... (Form Layout code similar to original but compacted) ...
-        # For brevity, assuming layout code here matches original add_new_function structure
+        def guess_icon_from_shortcut():
+            """Guess the best icon based on shortcut text."""
+            shortcut_text = shortcut_var.get().strip().lower()
+            if not shortcut_text:
+                return
+            
+            # Get available icons
+            available_icons_list = self.get_available_icons()
+            
+            # Icon matching keywords mapping
+            icon_keyword_map = {
+                "light": ["light", "lamp", "beam", "sidelight", "interior_light", "cabin_light", "cycle_light", "all_round_light", "back_light"],
+                "sound": ["sound", "sound1", "sound2", "sound3", "sound4", "curve_sound", "sound_brake"],
+                "horn": ["horn", "horn_high", "horn_low", "horn_two_sound"],
+                "bell": ["bell"],
+                "whistle": ["whistle", "whistle_long", "whistle_short"],
+                "couple": ["couple"],
+                "decouple": ["decouple"],
+                "fan": ["fan", "fan_strong", "blower"],
+                "compressor": ["compressor"],
+                "pump": ["pump", "feed_pump", "air_pump"],
+                "door": ["door", "door_open", "door_close"],
+                "brake": ["brake", "brake_delay", "handbrake"],
+                "steam": ["steam", "dump_steam"],
+                "drain": ["drain", "drainage", "drain_mud", "drain_valve"],
+                "diesel": ["diesel", "diesel_generator", "diesel_regulation"],
+                "rail": ["rail", "rail_kick", "rail_crossing"],
+                "scoop": ["scoop", "scoop_coal"],
+                "shunting": ["shunting", "hump_gear"],
+                "l": ["light", "lamp"],
+                "h": ["horn"],
+                "b": ["bell", "brake"],
+                "w": ["whistle"],
+                "s": ["sound", "steam"],
+            }
+            
+            # Try exact match first
+            for icon_name in available_icons_list:
+                if shortcut_text == icon_name.lower():
+                    icon_var.set(icon_name)
+                    return
+            
+            # Try keyword matching
+            matched_icons = []
+            for keyword, icon_list in icon_keyword_map.items():
+                if keyword in shortcut_text:
+                    for icon_name in available_icons_list:
+                        if any(icon_keyword.lower() in icon_name.lower() for icon_keyword in icon_list):
+                            if icon_name not in matched_icons:
+                                matched_icons.append(icon_name)
+            
+            # If found matches, use the first one
+            if matched_icons:
+                icon_var.set(matched_icons[0])
+                return
+            
+            # Try partial match in icon names
+            for icon_name in available_icons_list:
+                icon_lower = icon_name.lower()
+                if shortcut_text in icon_lower or icon_lower in shortcut_text:
+                    icon_var.set(icon_name)
+                    return
+        
+        guess_button = ctk.CTkButton(shortcut_frame, text="Guess", command=guess_icon_from_shortcut, width=60)
+        guess_button.pack(side="left")
+
+        # Button Type
+        ctk.CTkLabel(form_frame, text="Button Type:").grid(row=3, column=0, padx=10, pady=5, sticky="w")
+        button_type_combo = ctk.CTkComboBox(form_frame, variable=button_type_var, 
+                                           values=["switch", "push-button", "time button"], 
+                                           state="readonly", width=150)
+        button_type_combo.grid(row=3, column=1, padx=10, pady=5, sticky="w")
+
+        # Time (only for time button)
+        time_label = ctk.CTkLabel(form_frame, text="Time (seconds):")
+        time_label.grid(row=4, column=0, padx=10, pady=5, sticky="w")
+        time_entry = ctk.CTkEntry(form_frame, textvariable=time_var, width=100)
+        time_entry.grid(row=4, column=1, padx=10, pady=5, sticky="w")
+
+        def update_time_visibility(*args):
+            is_time_button = button_type_var.get() == "time button"
+            time_label.grid_remove() if not is_time_button else time_label.grid()
+            time_entry.grid_remove() if not is_time_button else time_entry.grid()
+            # Update window size to fit content
+            dialog.update_idletasks()
+            main_frame.update_idletasks()
+            # Calculate required height based on content
+            required_height = main_frame.winfo_reqheight() + 60  # Add padding for window decorations
+            current_width = max(400, dialog.winfo_width() if dialog.winfo_width() > 1 else 400)
+            dialog.geometry(f"{current_width}x{max(required_height, 300)}")
+        button_type_var.trace("w", update_time_visibility)
+        update_time_visibility()  # Initial state
         
         def save_function():
             try:
@@ -1959,13 +2375,167 @@ Function Details:  {len(loco.function_details)} available
             except ValueError as e:
                 messagebox.showerror("Error", f"Invalid input: {e}")
 
-        # Add buttons to dialog
-        # ...
+        button_frame = ctk.CTkFrame(main_frame)
+        button_frame.pack(fill="x", pady=(15, 0))
+        ctk.CTkButton(button_frame, text="Save", command=save_function).pack(side="right", padx=5)
+        ctk.CTkButton(button_frame, text="Cancel", command=dialog.destroy).pack(side="right", padx=5)
+        
+        # Set minimum size and let window auto-resize based on content
+        dialog.minsize(400, 300)
+        dialog.resizable(True, True)
+        # Auto-size window to fit content
+        dialog.update_idletasks()
+        main_frame.update_idletasks()
+        # Calculate initial window size based on content
+        required_height = main_frame.winfo_reqheight() + 60  # Add padding for window decorations
+        dialog.geometry(f"400x{max(required_height, 300)}")
 
     def edit_function(self, func_num: int, func_info: FunctionInfo):
-        # ... (Similar cleanup for edit_function) ...
-        # Assuming implementation matches add_new_function but with pre-filled values
-        pass
+        """Open dialog to edit an existing function."""
+        if not self.current_loco:
+            messagebox.showwarning("No Locomotive", "Please select a locomotive first.")
+            return
+
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title(f"Edit Function F{func_num}")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        icon_var = ctk.StringVar(value=func_info.image_name or "")
+        func_num_var = ctk.StringVar(value=str(func_num))
+        shortcut_var = ctk.StringVar(value=func_info.shortcut or "")
+        
+        button_type_map_reverse = {0: "switch", 1: "push-button", 2: "time button"}
+        button_type_var = ctk.StringVar(value=button_type_map_reverse.get(func_info.button_type, "switch"))
+        time_var = ctk.StringVar(value=func_info.time if func_info.button_type == 2 else "0")
+
+        main_frame = ctk.CTkFrame(dialog)
+        main_frame.pack(fill="both", expand=True, padx=15, pady=15)
+
+        preview_frame = ctk.CTkFrame(main_frame)
+        preview_frame.pack(fill="x", pady=(0, 15))
+        
+        # Icon Preview Label with initial size
+        icon_preview_label = ctk.CTkLabel(preview_frame, text="Icon Preview", fg_color="white", width=80, height=80)
+        icon_preview_label.pack(pady=5)
+
+        def update_icon_preview(*args):
+            icon_name = icon_var.get()
+            if icon_name:
+                preview_image = self.load_icon_image(icon_name, (80, 80))
+                if preview_image:
+                    icon_preview_label.configure(image=preview_image, text="")
+                    icon_preview_label.image = preview_image
+                else:
+                    icon_preview_label.configure(image=None, text="No icon found")
+                    icon_preview_label.image = None
+            else:
+                icon_preview_label.configure(image=None, text="Icon Preview")
+                icon_preview_label.image = None
+        icon_var.trace("w", update_icon_preview)
+        update_icon_preview()  # Initial preview
+
+        form_frame = ctk.CTkFrame(main_frame)
+        form_frame.pack(fill="both", expand=True)
+
+        # Function Number
+        ctk.CTkLabel(form_frame, text="Function Number:").grid(row=0, column=0, padx=10, pady=5, sticky="w")
+        func_num_entry = ctk.CTkEntry(form_frame, textvariable=func_num_var, width=100)
+        func_num_entry.grid(row=0, column=1, padx=10, pady=5, sticky="w")
+
+        # Icon Selection
+        ctk.CTkLabel(form_frame, text="Icon:").grid(row=1, column=0, padx=10, pady=5, sticky="w")
+        available_icons = self.get_available_icons()
+        icon_combo = ctk.CTkComboBox(form_frame, variable=icon_var, values=available_icons, width=200)
+        icon_combo.grid(row=1, column=1, padx=10, pady=5, sticky="w")
+
+        # Shortcut
+        ctk.CTkLabel(form_frame, text="Shortcut:").grid(row=2, column=0, padx=10, pady=5, sticky="w")
+        shortcut_entry = ctk.CTkEntry(form_frame, textvariable=shortcut_var, width=100)
+        shortcut_entry.grid(row=2, column=1, padx=10, pady=5, sticky="w")
+
+        # Button Type
+        ctk.CTkLabel(form_frame, text="Button Type:").grid(row=3, column=0, padx=10, pady=5, sticky="w")
+        button_type_combo = ctk.CTkComboBox(form_frame, variable=button_type_var, 
+                                           values=["switch", "push-button", "time button"], 
+                                           state="readonly", width=150)
+        button_type_combo.grid(row=3, column=1, padx=10, pady=5, sticky="w")
+
+        # Time (only for time button)
+        time_label = ctk.CTkLabel(form_frame, text="Time (seconds):")
+        time_label.grid(row=4, column=0, padx=10, pady=5, sticky="w")
+        time_entry = ctk.CTkEntry(form_frame, textvariable=time_var, width=100)
+        time_entry.grid(row=4, column=1, padx=10, pady=5, sticky="w")
+
+        def update_time_visibility(*args):
+            is_time_button = button_type_var.get() == "time button"
+            time_label.grid_remove() if not is_time_button else time_label.grid()
+            time_entry.grid_remove() if not is_time_button else time_entry.grid()
+            # Update window size to fit content
+            dialog.update_idletasks()
+            main_frame.update_idletasks()
+            # Calculate required height based on content
+            required_height = main_frame.winfo_reqheight() + 60  # Add padding for window decorations
+            current_width = max(400, dialog.winfo_width() if dialog.winfo_width() > 1 else 400)
+            dialog.geometry(f"{current_width}x{max(required_height, 300)}")
+        button_type_var.trace("w", update_time_visibility)
+        update_time_visibility()  # Initial state
+
+        def save_function():
+            try:
+                icon_name = icon_var.get()
+                if not icon_name:
+                    messagebox.showerror("Error", "Please select an icon.")
+                    return
+                new_func_num = int(func_num_var.get())
+                if new_func_num < 0 or new_func_num > 127:
+                    messagebox.showerror("Error", "Function number must be between 0 and 127.")
+                    return
+                
+                # If function number changed, check if new number already exists
+                if new_func_num != func_num and new_func_num in self.current_loco.function_details:
+                    if not messagebox.askyesno("Overwrite?", f"Function F{new_func_num} already exists. Overwrite it?"):
+                        return
+                    # Remove old function number if it's different
+                    if new_func_num != func_num:
+                        del self.current_loco.function_details[func_num]
+                        if func_num in self.current_loco.functions:
+                            del self.current_loco.functions[func_num]
+
+                button_type_map = {"switch": 0, "push-button": 1, "time button": 2}
+                button_type = button_type_map.get(button_type_var.get(), 0)
+                time_str = str(float(time_var.get())) if button_type == 2 else "0"
+
+                # Keep existing position
+                func_info_new = FunctionInfo(new_func_num, icon_name, shortcut_var.get().strip(), 
+                                            func_info.position, time_str, button_type, True)
+                
+                self.current_loco.function_details[new_func_num] = func_info_new
+                self.current_loco.functions[new_func_num] = True
+                if self.current_loco_index is not None:
+                    self.z21_data.locomotives[self.current_loco_index] = self.current_loco
+
+                self.update_functions()
+                self.update_overview()
+                dialog.destroy()
+                self.set_status_message(f"Function F{new_func_num} updated successfully!")
+            except ValueError as e:
+                messagebox.showerror("Error", f"Invalid input: {e}")
+
+        button_frame = ctk.CTkFrame(main_frame)
+        button_frame.pack(fill="x", pady=(15, 0))
+        ctk.CTkButton(button_frame, text="Save", command=save_function).pack(side="right", padx=5)
+        ctk.CTkButton(button_frame, text="Cancel", command=dialog.destroy).pack(side="right", padx=5)
+        
+        # Set minimum size and let window auto-resize based on content
+        dialog.minsize(400, 300)
+        dialog.resizable(True, True)
+        # Auto-size window to fit content
+        dialog.update_idletasks()
+        main_frame.update_idletasks()
+        # Calculate initial window size based on content
+        required_height = main_frame.winfo_reqheight() + 60  # Add padding for window decorations
+        dialog.geometry(f"400x{max(required_height, 300)}")
 
     def load_icon_image(self, icon_name: str = None, size: tuple = (80, 80)):
         """Load icon image with black foreground and white background."""
