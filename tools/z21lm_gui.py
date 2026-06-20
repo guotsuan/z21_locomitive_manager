@@ -72,7 +72,7 @@ class Z21GUI(Z21GUIOperationsMixin):
         self.original_loco_address: Optional[int] = None
         self.user_selected_loco: Optional[Locomotive] = None
         self.default_icon_path = Path(
-            __file__).parent.parent / "icons" / "neutrals_normal.png"
+            __file__).parent.parent / "icons" / "neutral_Normal.png"
         self.icon_cache = {}
         self.icon_mapping = self.load_icon_mapping()
         self.status_timeout_id = None

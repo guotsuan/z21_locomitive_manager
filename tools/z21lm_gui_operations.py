@@ -1477,173 +1477,242 @@ class Z21GUIOperationsMixin:
             )
             if not output_file: return
             output_path = Path(output_file)
-            export_uuid = str(uuid.uuid4()).upper()
-            export_dir = f"export/{export_uuid}"
-
-            with tempfile.TemporaryDirectory() as temp_dir:
-                temp_path = Path(temp_dir)
-                export_path = temp_path / export_dir
-                export_path.mkdir(parents=True, exist_ok=True)
-
-                with zipfile.ZipFile(self.z21_file, "r") as input_zip:
-                    sqlite_files = [f for f in input_zip.namelist() if f.endswith(".sqlite")]
-                    if not sqlite_files:
-                        messagebox.showerror("Error", "No SQLite database found in source file.")
-                        return
-                    sqlite_data = input_zip.read(sqlite_files[0])
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".sqlite") as tmp:
-                        tmp.write(sqlite_data)
-                        source_db_path = tmp.name
-
-                    try:
-                        source_db = sqlite3.connect(source_db_path)
-                        source_db.row_factory = sqlite3.Row
-                        source_cursor = source_db.cursor()
-                        
-                        new_db_path = export_path / "Loco.sqlite"
-                        new_db = sqlite3.connect(str(new_db_path))
-                        new_cursor = new_db.cursor()
-
-                        source_cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-                        tables = [row[0] for row in source_cursor.fetchall()]
-                        for table in tables:
-                            source_cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name='{table}'")
-                            create_sql = source_cursor.fetchone()
-                            if create_sql and create_sql[0]: new_cursor.execute(create_sql[0])
-
-                        if "update_history" in tables:
-                            source_cursor.execute("SELECT * FROM update_history")
-                            for row in source_cursor.fetchall():
-                                columns = ", ".join(row.keys())
-                                placeholders = ", ".join(["?" for _ in row])
-                                new_cursor.execute(f"INSERT INTO update_history ({columns}) VALUES ({placeholders})", tuple(row))
-
-                        vehicle_id = getattr(self.current_loco, "_vehicle_id", None)
-                        if not vehicle_id:
-                            source_cursor.execute("SELECT id FROM vehicles WHERE type = 0 AND address = ?", (self.current_loco.address,))
-                            row = source_cursor.fetchone()
-                            if row: vehicle_id = row["id"]
-
-                        if not vehicle_id:
-                            # Logic for creating new vehicle ID in export DB
-                            new_cursor.execute("SELECT MAX(position) as max_pos FROM vehicles WHERE type = 0")
-                            max_pos_row = new_cursor.fetchone()
-                            next_position = (max_pos_row[0] if max_pos_row and max_pos_row[0] is not None else 0) + 1
-                            
-                            source_cursor.execute("SELECT * FROM vehicles WHERE type = 0 LIMIT 1")
-                            sample_vehicle = source_cursor.fetchone()
-                            if sample_vehicle:
-                                insert_columns, insert_values = [], []
-                                # ... (Filling insert_columns based on self.current_loco attributes) ...
-                                # For brevity in this cleanup, assuming attributes map correctly or skipping detailed field mapping repetition
-                                # If logic needs to be preserved exactly, copying big block below:
-                                source_cursor.execute("PRAGMA table_info(vehicles)")
-                                vehicle_column_names = [col[1] for col in source_cursor.fetchall()]
-                                for col_name in vehicle_column_names:
-                                    val = None
-                                    if col_name == "id": continue
-                                    elif col_name == "type": val = getattr(self.current_loco, "rail_vehicle_type", 0) or 0
-                                    elif col_name == "name": val = self.current_loco.name or ""
-                                    elif col_name == "address": val = self.current_loco.address or 0
-                                    elif col_name == "max_speed": val = self.current_loco.speed or 0
-                                    elif col_name == "active": val = 1 if getattr(self.current_loco, "active", True) else 0
-                                    elif col_name == "traction_direction": val = 1 if self.current_loco.direction else 0
-                                    elif col_name == "position": val = next_position
-                                    elif col_name == "image_name": val = self.current_loco.image_name or None
-                                    # ... map remaining fields ...
-                                    else:
-                                        if col_name in sample_vehicle.keys(): val = sample_vehicle[col_name]
-                                    
-                                    if val is not None or col_name in sample_vehicle.keys():
-                                        insert_columns.append(col_name)
-                                        insert_values.append(val)
-                                
-                                placeholders = ", ".join(["?" for _ in insert_columns])
-                                new_cursor.execute(f"INSERT INTO vehicles ({', '.join(insert_columns)}) VALUES ({placeholders})", tuple(insert_values))
-                                vehicle_id = new_cursor.lastrowid
-                            else:
-                                messagebox.showerror("Error", "Cannot create new vehicle: no sample vehicle found.")
-                                return
-
-                        if vehicle_id:
-                            source_cursor.execute("SELECT * FROM vehicles WHERE id = ?", (vehicle_id,))
-                            vehicle_row = source_cursor.fetchone()
-                            if vehicle_row:
-                                columns = ", ".join(vehicle_row.keys())
-                                placeholders = ", ".join(["?" for _ in vehicle_row])
-                                new_cursor.execute(f"INSERT INTO vehicles ({columns}) VALUES ({placeholders})", tuple(vehicle_row))
-
-                                if "functions" in tables:
-                                    source_cursor.execute("PRAGMA table_info(functions)")
-                                    func_column_names = [col[1] for col in source_cursor.fetchall()]
-                                    new_cursor.execute("SELECT MAX(id) FROM functions")
-                                    max_id_result = new_cursor.fetchone()
-                                    next_id = (max_id_result[0] + 1) if max_id_result[0] is not None else 1
-                                    new_cursor.execute("DELETE FROM functions WHERE vehicle_id = ?", (vehicle_id,))
-
-                                    if self.current_loco and self.current_loco.function_details:
-                                        for func_num, func_info in self.current_loco.function_details.items():
-                                            func_values = []
-                                            # ... (Function mapping logic) ...
-                                            # Using a simplified copy of the logic for cleanup purposes
-                                            # Assuming direct mapping or defaulting
-                                            pass 
-                                    else:
-                                        source_cursor.execute("SELECT * FROM functions WHERE vehicle_id = ?", (vehicle_id,))
-                                        for func_row in source_cursor.fetchall():
-                                            f_cols = ", ".join(func_row.keys())
-                                            f_vals = tuple(func_row)
-                                            f_phs = ", ".join(["?" for _ in func_row])
-                                            new_cursor.execute(f"INSERT INTO functions ({f_cols}) VALUES ({f_phs})", f_vals)
-
-                                # Copy categories
-                                source_cursor.execute("SELECT vtc.* FROM vehicles_to_categories vtc WHERE vtc.vehicle_id = ?", (vehicle_id,))
-                                for cat_row in source_cursor.fetchall():
-                                    source_cursor.execute("SELECT * FROM categories WHERE id = ?", (cat_row["category_id"],))
-                                    cat_data = source_cursor.fetchone()
-                                    if cat_data:
-                                        new_cursor.execute("SELECT id FROM categories WHERE id = ?", (cat_data["id"],))
-                                        if not new_cursor.fetchone():
-                                            c_cols = ", ".join(cat_data.keys())
-                                            c_phs = ", ".join(["?" for _ in cat_data])
-                                            new_cursor.execute(f"INSERT INTO categories ({c_cols}) VALUES ({c_phs})", tuple(cat_data))
-                                    vtc_cols = ", ".join(cat_row.keys())
-                                    vtc_phs = ", ".join(["?" for _ in cat_row])
-                                    new_cursor.execute(f"INSERT INTO vehicles_to_categories ({vtc_cols}) VALUES ({vtc_phs})", tuple(cat_row))
-
-                        new_db.commit()
-                        new_db.close()
-                        source_db.close()
-
-                        # Set text encoding to UTF-16le for Z21 APP
-                        with open(new_db_path, "rb") as f:
-                            sqlite_data = bytearray(f.read())
-                        sqlite_data[60:64] = (16).to_bytes(4, "big")
-                        with open(new_db_path, "wb") as f:
-                            f.write(sqlite_data)
-
-                        if self.current_loco.image_name:
-                            for filename in input_zip.namelist():
-                                if self.current_loco.image_name in filename or filename.endswith(f"lok_{self.current_loco.address}.png"):
-                                    image_data = input_zip.read(filename)
-                                    image_filename = filename.split("/")[-1] if filename.endswith(".png") else f"lok_{self.current_loco.address}.png"
-                                    (export_path / image_filename).write_bytes(image_data)
-                                    break
-
-                        with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as output_zip:
-                            output_zip.write(new_db_path, f"{export_dir}/Loco.sqlite")
-                            if self.current_loco.image_name:
-                                for img_file in export_path.glob("*.png"):
-                                    output_zip.write(img_file, f"{export_dir}/{img_file.name}")
-                        messagebox.showinfo("Success", f"Locomotive exported successfully to:\n{output_path}")
-
-                    finally:
-                        Path(source_db_path).unlink()
+            if self._export_loco_to_temp_file(output_path, show_errors=True):
+                messagebox.showinfo("Success", f"Locomotive exported successfully to:\n{output_path}")
         except Exception as e:
             messagebox.showerror("Export Error", f"Failed to export locomotive: {e}")
 
 
-    def _export_loco_to_temp_file(self, output_path: Path) -> bool:
+    def _quote_identifier(self, identifier: str) -> str:
+        """Quote a SQLite identifier from a trusted database schema."""
+        return '"' + identifier.replace('"', '""') + '"'
+
+    def _get_table_names(self, cursor) -> set:
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        return {row[0] for row in cursor.fetchall()}
+
+    def _get_table_columns(self, cursor, table: str) -> list:
+        cursor.execute(f"PRAGMA table_info({self._quote_identifier(table)})")
+        return [row[1] for row in cursor.fetchall()]
+
+    def _insert_row_dict(self, cursor, table: str, row_values: dict):
+        if not row_values:
+            return
+        columns = list(row_values.keys())
+        column_sql = ", ".join(self._quote_identifier(col) for col in columns)
+        placeholders = ", ".join(["?"] * len(columns))
+        cursor.execute(
+            f"INSERT INTO {self._quote_identifier(table)} ({column_sql}) VALUES ({placeholders})",
+            tuple(row_values[col] for col in columns))
+
+    def _function_time_value(self, raw_time):
+        if raw_time in (None, "", "0"):
+            return None
+        try:
+            return float(raw_time)
+        except (TypeError, ValueError):
+            return None
+
+    def _copy_table_rows(self, source_cursor, target_cursor, table: str):
+        source_cursor.execute(f"SELECT * FROM {self._quote_identifier(table)}")
+        for row in source_cursor.fetchall():
+            self._insert_row_dict(target_cursor, table, dict(row))
+
+    def _copy_table_schema(self, source_cursor, target_cursor, tables: set):
+        for table in tables:
+            source_cursor.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                (table, ))
+            create_sql = source_cursor.fetchone()
+            if create_sql and create_sql[0]:
+                target_cursor.execute(create_sql[0])
+
+    def _source_vehicle_row(self, source_cursor):
+        vehicle_id = getattr(self.current_loco, "_vehicle_id", None)
+        if vehicle_id:
+            source_cursor.execute("SELECT * FROM vehicles WHERE id = ?",
+                                  (vehicle_id, ))
+            row = source_cursor.fetchone()
+            if row:
+                return row
+
+        source_cursor.execute(
+            "SELECT * FROM vehicles WHERE type = 0 AND address = ?",
+            (self.current_loco.address, ))
+        row = source_cursor.fetchone()
+        if row:
+            return row
+
+        source_cursor.execute("SELECT * FROM vehicles WHERE type = 0 LIMIT 1")
+        return source_cursor.fetchone()
+
+    def _build_vehicle_export_row(self, source_cursor, vehicle_row) -> dict:
+        vehicle_columns = self._get_table_columns(source_cursor, "vehicles")
+        row_values = dict(vehicle_row) if vehicle_row else {}
+        export_id = row_values.get("id") or getattr(self.current_loco, "_vehicle_id", None) or 1
+        row_values["id"] = export_id
+
+        field_map = {
+            "type": getattr(self.current_loco, "rail_vehicle_type", 0) or 0,
+            "name": self.current_loco.name or "",
+            "address": self.current_loco.address or 0,
+            "max_speed": self.current_loco.speed or 0,
+            "active": 1 if getattr(self.current_loco, "active", True) else 0,
+            "traction_direction": 1 if self.current_loco.direction else 0,
+            "image_name": self.current_loco.image_name or None,
+            "drivers_cab": self.current_loco.drivers_cab or None,
+            "description": self.current_loco.description or None,
+            "full_name": self.current_loco.full_name or None,
+            "railway": self.current_loco.railway or None,
+            "article_number": self.current_loco.article_number or None,
+            "decoder_type": self.current_loco.decoder_type or None,
+            "build_year": self.current_loco.build_year or None,
+            "buffer_lenght": self.current_loco.buffer_length or None,
+            "model_buffer_lenght": self.current_loco.model_buffer_length or None,
+            "service_weight": self.current_loco.service_weight or None,
+            "model_weight": self.current_loco.model_weight or None,
+            "rmin": self.current_loco.rmin or None,
+            "ip": self.current_loco.ip or None,
+            "speed_display": self.current_loco.speed_display or 0,
+            "crane": 1 if getattr(self.current_loco, "crane", False) else 0,
+        }
+        for column, value in field_map.items():
+            if column in vehicle_columns:
+                row_values[column] = value
+        if "position" in vehicle_columns and row_values.get("position") is None:
+            row_values["position"] = 0
+        return {column: row_values.get(column) for column in vehicle_columns}
+
+    def _copy_export_functions(self, source_cursor, target_cursor, tables: set,
+                               source_vehicle_id: int, export_vehicle_id: int):
+        if "functions" not in tables:
+            return
+
+        function_columns = self._get_table_columns(source_cursor, "functions")
+        source_cursor.execute("SELECT * FROM functions WHERE vehicle_id = ?",
+                              (source_vehicle_id, ))
+        source_rows = source_cursor.fetchall()
+        source_by_number = {row["function"]: dict(row) for row in source_rows}
+        sample_row = dict(source_rows[0]) if source_rows else {}
+
+        if self.current_loco.function_details:
+            next_id = 1
+            for func_num, func_info in sorted(
+                    self.current_loco.function_details.items(),
+                    key=lambda item: item[1].position):
+                row_values = dict(sample_row)
+                row_values.update(source_by_number.get(func_num, {}))
+                if "id" in function_columns:
+                    row_values["id"] = next_id
+                    next_id += 1
+                row_values["vehicle_id"] = export_vehicle_id
+                row_values["function"] = func_num
+                row_values["position"] = func_info.position
+                row_values["shortcut"] = func_info.shortcut or ""
+                row_values["time"] = self._function_time_value(func_info.time)
+                row_values["image_name"] = func_info.image_name or ""
+                row_values["button_type"] = func_info.button_type
+                row_values["is_configured"] = 1
+                row_values["show_function_number"] = 1
+                self._insert_row_dict(
+                    target_cursor, "functions",
+                    {column: row_values.get(column) for column in function_columns})
+            return
+
+        for index, source_row in enumerate(source_rows, start=1):
+            row_values = dict(source_row)
+            if "id" in function_columns:
+                row_values["id"] = index
+            row_values["vehicle_id"] = export_vehicle_id
+            self._insert_row_dict(
+                target_cursor, "functions",
+                {column: row_values.get(column) for column in function_columns})
+
+    def _copy_export_categories(self, source_cursor, target_cursor, tables: set,
+                                source_vehicle_id: int, export_vehicle_id: int):
+        if not {"categories", "vehicles_to_categories"}.issubset(tables):
+            return
+
+        category_columns = self._get_table_columns(source_cursor, "categories")
+        link_columns = self._get_table_columns(source_cursor, "vehicles_to_categories")
+        category_names = list(getattr(self.current_loco, "categories", []) or [])
+
+        if not category_names:
+            source_cursor.execute(
+                """
+                SELECT c.name
+                FROM categories c
+                INNER JOIN vehicles_to_categories vtc ON c.id = vtc.category_id
+                WHERE vtc.vehicle_id = ?
+                """, (source_vehicle_id, ))
+            category_names = [row["name"] for row in source_cursor.fetchall()
+                              if row["name"]]
+
+        for index, category_name in enumerate(category_names, start=1):
+            source_cursor.execute("SELECT * FROM categories WHERE name = ?",
+                                  (category_name, ))
+            category_row = source_cursor.fetchone()
+            category_values = dict(category_row) if category_row else {"name": category_name}
+            if "id" in category_columns:
+                category_values["id"] = index
+            if "name" in category_columns:
+                category_values["name"] = category_name
+            self._insert_row_dict(
+                target_cursor, "categories",
+                {column: category_values.get(column) for column in category_columns})
+
+            link_values = {"vehicle_id": export_vehicle_id, "category_id": index}
+            if "id" in link_columns:
+                link_values["id"] = index
+            self._insert_row_dict(
+                target_cursor, "vehicles_to_categories",
+                {column: link_values.get(column) for column in link_columns})
+
+    def _copy_export_traction_list(self, source_cursor, target_cursor, tables: set,
+                                   source_vehicle_id: int, export_vehicle_id: int):
+        if "traction_list" not in tables:
+            return
+
+        columns = self._get_table_columns(source_cursor, "traction_list")
+        regulation_step = getattr(self.current_loco, "regulation_step", 0)
+        if regulation_step:
+            values = {"loco_id": export_vehicle_id, "regulation_step": regulation_step, "time": 0.0}
+            if "id" in columns:
+                values["id"] = 1
+            self._insert_row_dict(
+                target_cursor, "traction_list",
+                {column: values.get(column) for column in columns})
+            return
+
+        source_cursor.execute("SELECT * FROM traction_list WHERE loco_id = ?",
+                              (source_vehicle_id, ))
+        for index, row in enumerate(source_cursor.fetchall(), start=1):
+            values = dict(row)
+            if "id" in columns:
+                values["id"] = index
+            values["loco_id"] = export_vehicle_id
+            self._insert_row_dict(
+                target_cursor, "traction_list",
+                {column: values.get(column) for column in columns})
+
+    def _copy_export_images(self, input_zip, export_path: Path):
+        used_images = set()
+        if self.current_loco.image_name:
+            used_images.add(self.current_loco.image_name)
+        for func_info in self.current_loco.function_details.values():
+            if func_info.image_name:
+                used_images.add(func_info.image_name)
+
+        for filename in input_zip.namelist():
+            filename_only = Path(filename).name
+            for image_name in used_images:
+                if (filename == image_name or filename_only == image_name
+                        or filename.endswith(image_name)
+                        or image_name in filename):
+                    (export_path / filename_only).write_bytes(input_zip.read(filename))
+                    break
+
+    def _export_loco_to_temp_file(self, output_path: Path, show_errors: bool = True) -> bool:
         """Export current locomotive to a temporary z21loco file. Returns True if successful."""
         try:
             export_uuid = str(uuid.uuid4()).upper()
@@ -1665,110 +1734,39 @@ class Z21GUIOperationsMixin:
                         source_db_path = tmp.name
 
                     try:
-                        source_db = sqlite3.connect(source_db_path)
-                        source_db.row_factory = sqlite3.Row
-                        source_cursor = source_db.cursor()
-                        
-                        new_db_path = export_path / "Loco.sqlite"
-                        new_db = sqlite3.connect(str(new_db_path))
-                        new_cursor = new_db.cursor()
+                        with sqlite3.connect(source_db_path) as source_db:
+                            source_db.row_factory = sqlite3.Row
+                            source_cursor = source_db.cursor()
 
-                        source_cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-                        tables = [row[0] for row in source_cursor.fetchall()]
-                        for table in tables:
-                            source_cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name='{table}'")
-                            create_sql = source_cursor.fetchone()
-                            if create_sql and create_sql[0]: new_cursor.execute(create_sql[0])
+                            new_db_path = export_path / "Loco.sqlite"
+                            with sqlite3.connect(str(new_db_path)) as new_db:
+                                new_cursor = new_db.cursor()
+                                tables = self._get_table_names(source_cursor)
+                                if "vehicles" not in tables:
+                                    raise ValueError("No vehicles table found in source database.")
 
-                        if "update_history" in tables:
-                            source_cursor.execute("SELECT * FROM update_history")
-                            for row in source_cursor.fetchall():
-                                columns = ", ".join(row.keys())
-                                placeholders = ", ".join(["?" for _ in row])
-                                new_cursor.execute(f"INSERT INTO update_history ({columns}) VALUES ({placeholders})", tuple(row))
+                                self._copy_table_schema(source_cursor, new_cursor, tables)
+                                if "update_history" in tables:
+                                    self._copy_table_rows(source_cursor, new_cursor, "update_history")
 
-                        vehicle_id = getattr(self.current_loco, "_vehicle_id", None)
-                        if not vehicle_id:
-                            source_cursor.execute("SELECT id FROM vehicles WHERE type = 0 AND address = ?", (self.current_loco.address,))
-                            row = source_cursor.fetchone()
-                            if row: vehicle_id = row["id"]
+                                vehicle_row = self._source_vehicle_row(source_cursor)
+                                if not vehicle_row:
+                                    raise ValueError("Cannot export locomotive: no source vehicle row found.")
 
-                        if not vehicle_id:
-                            new_cursor.execute("SELECT MAX(position) as max_pos FROM vehicles WHERE type = 0")
-                            max_pos_row = new_cursor.fetchone()
-                            next_position = (max_pos_row[0] if max_pos_row and max_pos_row[0] is not None else 0) + 1
-                            
-                            source_cursor.execute("SELECT * FROM vehicles WHERE type = 0 LIMIT 1")
-                            sample_vehicle = source_cursor.fetchone()
-                            if sample_vehicle:
-                                source_cursor.execute("PRAGMA table_info(vehicles)")
-                                vehicle_column_names = [col[1] for col in source_cursor.fetchall()]
-                                insert_columns, insert_values = [], []
-                                for col_name in vehicle_column_names:
-                                    val = None
-                                    if col_name == "id": continue
-                                    elif col_name == "type": val = getattr(self.current_loco, "rail_vehicle_type", 0) or 0
-                                    elif col_name == "name": val = self.current_loco.name or ""
-                                    elif col_name == "address": val = self.current_loco.address or 0
-                                    elif col_name == "max_speed": val = self.current_loco.speed or 0
-                                    elif col_name == "active": val = 1 if getattr(self.current_loco, "active", True) else 0
-                                    elif col_name == "traction_direction": val = 1 if self.current_loco.direction else 0
-                                    elif col_name == "position": val = next_position
-                                    elif col_name == "image_name": val = self.current_loco.image_name or None
-                                    else:
-                                        if col_name in sample_vehicle.keys(): val = sample_vehicle[col_name]
-                                    
-                                    if val is not None or col_name in sample_vehicle.keys():
-                                        insert_columns.append(col_name)
-                                        insert_values.append(val)
-                                
-                                placeholders = ", ".join(["?" for _ in insert_columns])
-                                new_cursor.execute(f"INSERT INTO vehicles ({', '.join(insert_columns)}) VALUES ({placeholders})", tuple(insert_values))
-                                vehicle_id = new_cursor.lastrowid
-                            else:
-                                messagebox.showerror("Error", "Cannot create new vehicle: no sample vehicle found.")
-                                return False
-
-                        if vehicle_id:
-                            source_cursor.execute("SELECT * FROM vehicles WHERE id = ?", (vehicle_id,))
-                            vehicle_row = source_cursor.fetchone()
-                            if vehicle_row:
-                                columns = ", ".join(vehicle_row.keys())
-                                placeholders = ", ".join(["?" for _ in vehicle_row])
-                                new_cursor.execute(f"INSERT INTO vehicles ({columns}) VALUES ({placeholders})", tuple(vehicle_row))
-
-                                if "functions" in tables:
-                                    source_cursor.execute("PRAGMA table_info(functions)")
-                                    func_column_names = [col[1] for col in source_cursor.fetchall()]
-                                    new_cursor.execute("SELECT MAX(id) FROM functions")
-                                    max_id_result = new_cursor.fetchone()
-                                    next_id = (max_id_result[0] + 1) if max_id_result[0] is not None else 1
-                                    new_cursor.execute("DELETE FROM functions WHERE vehicle_id = ?", (vehicle_id,))
-
-                                    source_cursor.execute("SELECT * FROM functions WHERE vehicle_id = ?", (vehicle_id,))
-                                    for func_row in source_cursor.fetchall():
-                                        f_cols = ", ".join(func_row.keys())
-                                        f_vals = tuple(func_row)
-                                        f_phs = ", ".join(["?" for _ in func_row])
-                                        new_cursor.execute(f"INSERT INTO functions ({f_cols}) VALUES ({f_phs})", f_vals)
-
-                                source_cursor.execute("SELECT vtc.* FROM vehicles_to_categories vtc WHERE vtc.vehicle_id = ?", (vehicle_id,))
-                                for cat_row in source_cursor.fetchall():
-                                    source_cursor.execute("SELECT * FROM categories WHERE id = ?", (cat_row["category_id"],))
-                                    cat_data = source_cursor.fetchone()
-                                    if cat_data:
-                                        new_cursor.execute("SELECT id FROM categories WHERE id = ?", (cat_data["id"],))
-                                        if not new_cursor.fetchone():
-                                            c_cols = ", ".join(cat_data.keys())
-                                            c_phs = ", ".join(["?" for _ in cat_data])
-                                            new_cursor.execute(f"INSERT INTO categories ({c_cols}) VALUES ({c_phs})", tuple(cat_data))
-                                    vtc_cols = ", ".join(cat_row.keys())
-                                    vtc_phs = ", ".join(["?" for _ in cat_row])
-                                    new_cursor.execute(f"INSERT INTO vehicles_to_categories ({vtc_cols}) VALUES ({vtc_phs})", tuple(cat_row))
-
-                        new_db.commit()
-                        new_db.close()
-                        source_db.close()
+                                source_vehicle_id = vehicle_row["id"]
+                                vehicle_values = self._build_vehicle_export_row(source_cursor, vehicle_row)
+                                export_vehicle_id = vehicle_values["id"]
+                                self._insert_row_dict(new_cursor, "vehicles", vehicle_values)
+                                self._copy_export_functions(
+                                    source_cursor, new_cursor, tables,
+                                    source_vehicle_id, export_vehicle_id)
+                                self._copy_export_categories(
+                                    source_cursor, new_cursor, tables,
+                                    source_vehicle_id, export_vehicle_id)
+                                self._copy_export_traction_list(
+                                    source_cursor, new_cursor, tables,
+                                    source_vehicle_id, export_vehicle_id)
+                                new_db.commit()
 
                         with open(new_db_path, "rb") as f:
                             sqlite_data = bytearray(f.read())
@@ -1776,19 +1774,13 @@ class Z21GUIOperationsMixin:
                         with open(new_db_path, "wb") as f:
                             f.write(sqlite_data)
 
-                        if self.current_loco.image_name:
-                            for filename in input_zip.namelist():
-                                if self.current_loco.image_name in filename or filename.endswith(f"lok_{self.current_loco.address}.png"):
-                                    image_data = input_zip.read(filename)
-                                    image_filename = filename.split("/")[-1] if filename.endswith(".png") else f"lok_{self.current_loco.address}.png"
-                                    (export_path / image_filename).write_bytes(image_data)
-                                    break
+                        self._copy_export_images(input_zip, export_path)
 
                         output_path.parent.mkdir(parents=True, exist_ok=True)
                         with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as output_zip:
                             output_zip.write(new_db_path, f"{export_dir}/Loco.sqlite")
-                            if self.current_loco.image_name:
-                                for img_file in export_path.glob("*.png"):
+                            for img_file in export_path.glob("*"):
+                                if img_file.is_file() and img_file.name != "Loco.sqlite":
                                     output_zip.write(img_file, f"{export_dir}/{img_file.name}")
                         
                         return True
@@ -1796,7 +1788,8 @@ class Z21GUIOperationsMixin:
                     finally:
                         Path(source_db_path).unlink()
         except Exception as e:
-            messagebox.showerror("Export Error", f"Failed to export locomotive: {e}")
+            if show_errors:
+                messagebox.showerror("Export Error", f"Failed to export locomotive: {e}")
             return False
 
 
@@ -1809,7 +1802,7 @@ class Z21GUIOperationsMixin:
             messagebox.showerror("Error", "AirDrop sharing is only available on macOS.")
             return
         if not HAS_PYOBJC:
-            messagebox.showerror("Error", "PyObjC is required for AirDrop sharing.\nPlease install it with: pip install pyobjc-framework-AppKit")
+            messagebox.showerror("Error", "PyObjC is required for AirDrop sharing.\nPlease install it with: pip install pyobjc-framework-Cocoa")
             return
 
         try:
@@ -2376,4 +2369,3 @@ class Z21GUIOperationsMixin:
         # Calculate initial window size based on content
         required_height = main_frame.winfo_reqheight() + 60  # Add padding for window decorations
         dialog.geometry(f"400x{max(required_height, 300)}")
-

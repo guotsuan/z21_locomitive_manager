@@ -22,24 +22,46 @@ Use your cell phone camera to take a photo of your instruction sheet with the fu
 - Pillow>=9.0.0  
 - pytesseract>=0.3.10
 - pdf2image>=1.16.3
-- pyobjc-framework-AppKit>=9.0.0 
+- pyobjc-framework-Cocoa>=9.0.0,<12.0.0
 
 ## 🚀 Usage
 
 1. **Clone the repository** (or navigate to the project directory)
-2. **Install dependencies**:
+2. **Install dependencies with uv**:
+```bash
+uv sync
+```
+
+   To use a specific Python interpreter:
+```bash
+uv sync --python /Users/gq/miniforge3/bin/python
+```
+
+   Alternatively, install from `requirements.txt` with pip:
 ```bash
 pip install -r requirements.txt
 ```
 3. Launch the graphical interface to browse locomotives:
 
 ```bash
+# Run with uv
+uv run python tools/z21lm_gui.py
+uv run python tools/z21lm_gui.py z21_new.z21
+
 # Run with default file (z21_new.z21)
 python tools/z21lm_gui.py
 
 # Run with specific file
 python tools/z21lm_gui.py z21_new.z21
 python tools/z21lm_gui.py rocoData.z21
+```
+
+4. Use the command-line parser:
+
+```bash
+uv run z21lm --help
+uv run z21lm read z21_new.z21
+uv run z21lm export z21_new.z21 output.json
 ```
 
 **GUI Features**:
@@ -54,6 +76,8 @@ python tools/z21lm_gui.py rocoData.z21
 ```
 z21_locomitive_manager/
 ├── README.md                    # This file
+├── pyproject.toml               # uv/Python project configuration
+├── uv.lock                      # uv lockfile for reproducible installs
 ├── requirements.txt             # Python dependencies
 ├── icon_mapping.json            # Icon name mappings for function icons
 ├── src/                         # Core source code

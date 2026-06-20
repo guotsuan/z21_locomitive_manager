@@ -101,13 +101,19 @@ class Z21Parser:
             db.row_factory = sqlite3.Row  # Enable column access by name
             cursor = db.cursor()
 
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = {row['name'] for row in cursor.fetchall()}
+            if 'vehicles' not in tables:
+                return
+
             # Parse version from update_history (if available)
-            cursor.execute(
-                "SELECT MAX(to_database_version) as version FROM update_history"
-            )
-            version_row = cursor.fetchone()
-            if version_row and version_row['version']:
-                z21_file.version = version_row['version']
+            if 'update_history' in tables:
+                cursor.execute(
+                    "SELECT MAX(to_database_version) as version FROM update_history"
+                )
+                version_row = cursor.fetchone()
+                if version_row and version_row['version']:
+                    z21_file.version = version_row['version']
 
             # Check if 'in_stock_since' field exists in vehicles table
             cursor.execute("PRAGMA table_info(vehicles)")
@@ -189,65 +195,68 @@ class Z21Parser:
                     loco.in_stock_since = ''
 
                 # Parse categories for this vehicle
-                cursor.execute(
-                    """
-                    SELECT c.name 
-                    FROM categories c
-                    INNER JOIN vehicles_to_categories vtc ON c.id = vtc.category_id
-                    WHERE vtc.vehicle_id = ?
-                """, (vehicle['id'], ))
-                category_rows = cursor.fetchall()
-                loco.categories = [
-                    row['name'] for row in category_rows if row['name']
-                ]
+                if 'categories' in tables and 'vehicles_to_categories' in tables:
+                    cursor.execute(
+                        """
+                        SELECT c.name 
+                        FROM categories c
+                        INNER JOIN vehicles_to_categories vtc ON c.id = vtc.category_id
+                        WHERE vtc.vehicle_id = ?
+                    """, (vehicle['id'], ))
+                    category_rows = cursor.fetchall()
+                    loco.categories = [
+                        row['name'] for row in category_rows if row['name']
+                    ]
 
                 # Parse regulation_step from traction_list
-                cursor.execute(
-                    """
-                    SELECT regulation_step 
-                    FROM traction_list 
-                    WHERE loco_id = ?
-                    ORDER BY regulation_step
-                    LIMIT 1
-                """, (vehicle['id'], ))
-                regulation_row = cursor.fetchone()
-                if regulation_row:
-                    loco.regulation_step = regulation_row[
-                        'regulation_step'] or 0
+                if 'traction_list' in tables:
+                    cursor.execute(
+                        """
+                        SELECT regulation_step 
+                        FROM traction_list 
+                        WHERE loco_id = ?
+                        ORDER BY regulation_step
+                        LIMIT 1
+                    """, (vehicle['id'], ))
+                    regulation_row = cursor.fetchone()
+                    if regulation_row:
+                        loco.regulation_step = regulation_row[
+                            'regulation_step'] or 0
 
                 # Check for crane function (function number 28 is often used for crane)
                 # We'll check this after parsing functions
 
                 # Parse functions for this vehicle
-                cursor.execute(
-                    """
-                    SELECT function, position, shortcut, time, image_name, 
-                           show_function_number, is_configured, button_type
-                    FROM functions
-                    WHERE vehicle_id = ?
-                    ORDER BY position
-                """, (vehicle['id'], ))
+                if 'functions' in tables:
+                    cursor.execute(
+                        """
+                        SELECT function, position, shortcut, time, image_name, 
+                               show_function_number, is_configured, button_type
+                        FROM functions
+                        WHERE vehicle_id = ?
+                        ORDER BY position
+                    """, (vehicle['id'], ))
 
-                functions = cursor.fetchall()
-                for func in functions:
-                    func_num = func['function'] or 0
-                    # Function is considered active if it exists in the table
-                    loco.functions[func_num] = True
+                    functions = cursor.fetchall()
+                    for func in functions:
+                        func_num = func['function'] or 0
+                        # Function is considered active if it exists in the table
+                        loco.functions[func_num] = True
 
-                    # Store detailed function information
-                    func_info = FunctionInfo(
-                        function_number=func_num,
-                        image_name=func['image_name'] or '',
-                        shortcut=func['shortcut'] or '',
-                        position=func['position'] or 0,
-                        time=str(func['time'])
-                        if func['time'] is not None else '0',
-                        button_type=func['button_type']
-                        if func['button_type'] is not None else 0,
-                        is_active=
-                        True  # All functions in the table are considered active
-                    )
-                    loco.function_details[func_num] = func_info
+                        # Store detailed function information
+                        func_info = FunctionInfo(
+                            function_number=func_num,
+                            image_name=func['image_name'] or '',
+                            shortcut=func['shortcut'] or '',
+                            position=func['position'] or 0,
+                            time=str(func['time'])
+                            if func['time'] is not None else '0',
+                            button_type=func['button_type']
+                            if func['button_type'] is not None else 0,
+                            is_active=
+                            True  # All functions in the table are considered active
+                        )
+                        loco.function_details[func_num] = func_info
 
                 # TODO: Parse CVs if available in database
 
@@ -257,12 +266,13 @@ class Z21Parser:
             # TODO: Implement accessory parsing
 
             # Parse layouts
-            cursor.execute("SELECT id, name FROM layout_data")
-            layouts_data = cursor.fetchall()
-            for layout_row in layouts_data:
-                layout = Layout()
-                layout.name = layout_row['name'] or ''
-                z21_file.layouts.append(layout)
+            if 'layout_data' in tables:
+                cursor.execute("SELECT id, name FROM layout_data")
+                layouts_data = cursor.fetchall()
+                for layout_row in layouts_data:
+                    layout = Layout()
+                    layout.name = layout_row['name'] or ''
+                    z21_file.layouts.append(layout)
 
             db.close()
         finally:
@@ -628,7 +638,7 @@ class Z21Parser:
                          speed_display)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (loco.rail_vehicle_type or 0, loco.name, loco.address,
-                          loco.speed, 1 if loco.active else 1,
+                          loco.speed, 1 if loco.active else 0,
                           1 if loco.direction else 0, next_position,
                           loco.image_name or None, loco.drivers_cab
                           or None, loco.description or None, loco.full_name
