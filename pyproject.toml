@@ -1,0 +1,30 @@
+[project]
+name = "z21-locomotive-manager"
+version = "0.1.0"
+description = "Tools for reading, parsing, and managing Roco Z21 locomotive data files."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "customtkinter>=5.0.0",
+    "Pillow>=9.0.0",
+    "click>=8.0.0",
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "hexdump>=3.3",
+    "pytesseract>=0.3.10",
+    "pdf2image>=1.16.3",
+    "pyobjc-framework-Cocoa>=9.0.0,<12.0.0; sys_platform == 'darwin'",
+]
+
+[project.scripts]
+z21lm = "src.cli:main"
+
+[tool.uv]
+package = true
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["src*"]
