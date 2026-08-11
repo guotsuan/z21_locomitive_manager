@@ -27,11 +27,7 @@ from pathlib import Path
 from typing import Optional
 import json
 import re
-import tempfile
 import zipfile
-import sqlite3
-import uuid
-import subprocess
 import platform
 
 # Try to import PyObjC for macOS sharing

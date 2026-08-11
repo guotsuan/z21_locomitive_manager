@@ -82,10 +82,13 @@ z21_locomitive_manager/
 ├── icon_mapping.json            # Icon name mappings for function icons
 ├── src/                         # Core source code
 │   ├── __init__.py
+│   ├── archive.py               # ZIP discovery, validation, and atomic writes
 │   ├── binary_reader.py         # Binary file reading utilities
 │   ├── cli.py                   # Command-line interface
 │   ├── data_models.py           # Data structure definitions
-│   └── parser.py                # File format parser (XML/SQLite)
+│   ├── parser.py                # Public format-orchestration facade
+│   ├── schema.py                # SQLite column and model mappings
+│   └── sqlite_repository.py     # SQLite read/write persistence
 ├── tools/                       # Utility scripts and GUI
 │   ├── __init__.py
 │   ├── z21lm_gui.py             # Main GUI browser application (customtkinter)
@@ -95,6 +98,16 @@ z21_locomitive_manager/
 ├── *.z21                        # Z21 database files (ZIP archives)
 └── *.z21loco                    # Individual locomotive files
 ```
+
+### Architecture
+
+The public `Z21Parser` API coordinates three independent layers:
+
+1. `Z21Archive` discovers archive members and performs validated atomic writes.
+2. `SQLiteZ21Repository` maps SQLite rows and relationships to domain models.
+3. `schema.py` centralizes version-tolerant vehicle column mappings.
+
+The CLI and GUI depend on the parser facade rather than ZIP or SQLite details.
 
 ### Format: SQLite (New Format)
 - File: `Loco.sqlite` inside ZIP archive

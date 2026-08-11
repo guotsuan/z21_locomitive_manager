@@ -1528,7 +1528,7 @@ class Z21GUIOperationsMixin:
                 target_cursor.execute(create_sql[0])
 
     def _source_vehicle_row(self, source_cursor):
-        vehicle_id = getattr(self.current_loco, "_vehicle_id", None)
+        vehicle_id = self.current_loco.vehicle_id
         if vehicle_id:
             source_cursor.execute("SELECT * FROM vehicles WHERE id = ?",
                                   (vehicle_id, ))
@@ -1549,7 +1549,7 @@ class Z21GUIOperationsMixin:
     def _build_vehicle_export_row(self, source_cursor, vehicle_row) -> dict:
         vehicle_columns = self._get_table_columns(source_cursor, "vehicles")
         row_values = dict(vehicle_row) if vehicle_row else {}
-        export_id = row_values.get("id") or getattr(self.current_loco, "_vehicle_id", None) or 1
+        export_id = row_values.get("id") or self.current_loco.vehicle_id or 1
         row_values["id"] = export_id
 
         field_map = {
@@ -1917,7 +1917,7 @@ class Z21GUIOperationsMixin:
                             imported_loco.functions[func_num] = True
 
                     import_db.close()
-                    imported_loco._is_new_import = True
+                    imported_loco.is_new_import = True
                     self.z21_data.locomotives.append(imported_loco)
 
                     if imported_loco.image_name:

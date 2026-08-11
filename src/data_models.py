@@ -63,6 +63,8 @@ class Locomotive:
     in_stock_since: str = ""  # Date when locomotive was added to stock
     regulation_step: int = 0  # Regulation step from traction_list
     rail_vehicle_type: int = 0  # Rail vehicle type: 0=Loco, 1=Wagon, 2=Accessory
+    vehicle_id: Optional[int] = None  # Stable SQLite identity
+    is_new_import: bool = False  # Force INSERT instead of address/name matching
     
     def __repr__(self):
         return f"Locomotive(address={self.address}, name='{self.name}')"
@@ -129,4 +131,3 @@ class Z21File:
                 f"accessories={len(self.accessories)}, "
                 f"layouts={len(self.layouts)}, "
                 f"unknown_blocks={len(self.unknown_blocks)})")
-
