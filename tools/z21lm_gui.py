@@ -32,7 +32,13 @@ import platform
 
 # Try to import PyObjC for macOS sharing
 try:
-    from AppKit import NSSharingService, NSURL, NSArray, NSWorkspace
+    from AppKit import (
+        NSApplication,
+        NSSharingService,
+        NSURL,
+        NSArray,
+        NSWorkspace,
+    )
     from Foundation import NSFileManager
     HAS_PYOBJC = True
 except ImportError:
@@ -50,6 +56,8 @@ sys.path.insert(0, str(project_root))
 
 from src.parser import Z21Parser
 from src.data_models import Z21File, Locomotive, FunctionInfo
+from src.function_extraction import discover_icon_mapping
+from src.categories import DEFAULT_LOCOMOTIVE_CATEGORIES
 from tools.z21lm_gui_operations import Z21GUIOperationsMixin
 
 
@@ -83,6 +91,37 @@ class Z21GUI(Z21GUIOperationsMixin):
         self.edit_function_dialog = None  # Track edit function dialog window
         self.setup_ui()
         self.load_data()
+        # Wait until Tk has created and laid out the native window before
+        # activating it. This brings the app forward once at launch without
+        # leaving it permanently above other applications.
+        self.root.after(100, self.bring_startup_window_to_front)
+
+    def bring_startup_window_to_front(self):
+        """Activate and focus the main window once after application startup."""
+        try:
+            self.root.deiconify()
+            self.root.update_idletasks()
+            if sys.platform == "darwin" and HAS_PYOBJC:
+                NSApplication.sharedApplication().activateIgnoringOtherApps_(
+                    True)
+            self.root.attributes("-topmost", True)
+            self.root.lift()
+            self.root.focus_force()
+            self.root.after(250, self._release_startup_topmost)
+        except Exception:
+            # Window-manager support varies; lift/focus are the safe fallback.
+            try:
+                self.root.lift()
+                self.root.focus_force()
+            except Exception:
+                pass
+
+    def _release_startup_topmost(self):
+        """Return the window to normal stacking behavior after activation."""
+        try:
+            self.root.attributes("-topmost", False)
+        except Exception:
+            pass
 
     def _set_mouse_over_function_icon(self, value: bool):
         """Set mouse over function icon flag and clear timeout ID."""
@@ -100,16 +139,18 @@ class Z21GUI(Z21GUIOperationsMixin):
             lambda: self.status_label.configure(text=self.default_status_text))
 
     def load_icon_mapping(self):
-        """Load icon mapping from JSON file."""
+        """Load configured aliases and dynamically include every PNG icon."""
         mapping_file = Path(__file__).parent.parent / "icon_mapping.json"
+        configured = {}
         if mapping_file.exists():
             try:
                 with open(mapping_file, "r") as f:
                     data = json.load(f)
-                    return data.get("matches", {})
+                    configured = data.get("matches", {})
             except Exception:
-                return {}
-        return {}
+                configured = {}
+        return discover_icon_mapping(
+            Path(__file__).parent.parent / "icons", configured)
 
     def update_status_count(self):
         """Update the default status text with current locomotive count."""
@@ -249,9 +290,14 @@ class Z21GUI(Z21GUIOperationsMixin):
             "<Down>", lambda e: self.on_arrow_down(e)
             if self.is_list_focused() else None)
 
-        # Status label
-        self.status_label = ctk.CTkLabel(left_frame, text="Loading...")
-        self.status_label.pack(fill="x", padx=5, pady=5)
+        # Status and application settings
+        footer_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
+        footer_frame.pack(fill="x", padx=5, pady=5)
+        self.status_label = ctk.CTkLabel(
+            footer_frame, text="Loading...", anchor="w")
+        self.status_label.pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(footer_frame, text="Settings", width=78,
+                      command=self.open_settings).pack(side="right", padx=(5, 0))
 
         # Right panel: Details
         right_frame = ctk.CTkFrame(main_paned)
@@ -518,8 +564,10 @@ class Z21GUI(Z21GUIOperationsMixin):
                                       pady=2,
                                       sticky="e")
         self.categories_var = ctk.StringVar()
-        self.categories_entry = ctk.CTkEntry(details_frame,
-                                             textvariable=self.categories_var)
+        self.categories_entry = ctk.CTkComboBox(
+            details_frame,
+            variable=self.categories_var,
+            values=list(DEFAULT_LOCOMOTIVE_CATEGORIES))
         self.categories_entry.grid(row=row,
                                    column=1,
                                    padx=(1, 3),
@@ -569,7 +617,7 @@ class Z21GUI(Z21GUIOperationsMixin):
         details_frame.grid_columnconfigure(2, weight=0)
         details_frame.grid_columnconfigure(3, weight=1, uniform="input_group")
 
-        # Action buttons - all in one row, evenly distributed in columns 1-3
+        # Action buttons in two rows to keep import labels readable.
         button_row = row
         # Create a button container that spans columns 1-3
         button_container = ctk.CTkFrame(details_frame, fg_color="transparent")
@@ -580,8 +628,7 @@ class Z21GUI(Z21GUIOperationsMixin):
                               pady=5,
                               sticky="ew")
 
-        # Configure button container columns for equal distribution of 4 buttons
-        for i in range(4):
+        for i in range(3):
             button_container.grid_columnconfigure(i,
                                                   weight=1,
                                                   uniform="buttons")
@@ -607,17 +654,28 @@ class Z21GUI(Z21GUIOperationsMixin):
         self.scan_button = ctk.CTkButton(button_container,
                                          text="Import from JSON",
                                          command=self.scan_for_details)
-        self.scan_button.grid(row=0,
-                              column=2,
+        self.scan_button.grid(row=1,
+                              column=0,
                               padx=(0, 5),
-                              pady=0,
+                              pady=(5, 0),
                               sticky="ew")
+
+        self.photo_import_button = ctk.CTkButton(
+            button_container,
+            text="Import from Photo",
+            command=self.import_from_photo)
+        self.photo_import_button.grid(row=1,
+                                      column=1,
+                                      columnspan=2,
+                                      padx=(0, 0),
+                                      pady=(5, 0),
+                                      sticky="ew")
 
         self.save_button = ctk.CTkButton(button_container,
                                          text="Save Changes",
                                          command=self.save_locomotive_changes)
         self.save_button.grid(row=0,
-                              column=3,
+                              column=2,
                               padx=(0, 0),
                               pady=0,
                               sticky="ew")
@@ -1092,7 +1150,7 @@ Function Details:  {len(loco.function_details)} available
         self.overview_text.configure(state="disabled")
 
 
-    def update_functions(self, is_resize=False):
+    def update_functions(self, is_resize=False, force=False):
         """Update functions tab."""
         loco = self.current_loco
         if not loco:
@@ -1207,7 +1265,8 @@ Function Details:  {len(loco.function_details)} available
         loco_changed = old_loco != loco
         
         # Skip redraw only if column count didn't change AND locomotive didn't change
-        if old_cols == new_cols and not is_first_show and not is_resize and not loco_changed:
+        if (old_cols == new_cols and not is_first_show and not is_resize and
+                not loco_changed and not force):
             # Nothing changed, skip redraw to prevent flickering
             return
         
@@ -1251,6 +1310,11 @@ Function Details:  {len(loco.function_details)} available
                       text="📄 Scan from JSON",
                       command=self.scan_from_json).pack(side="left",
                                                         padx=(0, 10))
+        self.function_scan_button = ctk.CTkButton(
+            button_frame,
+            text="Scan from iphone",
+            command=self.scan_functions_from_iphone)
+        self.function_scan_button.pack(side="left", padx=(0, 10))
         ctk.CTkButton(button_frame,
                       text="💾 Save Changes",
                       command=self.save_function_changes).pack(side="left")
@@ -1551,7 +1615,7 @@ Function Details:  {len(loco.function_details)} available
         return 128
 
     def get_available_icons(self):
-        """Get list of available icon names - only from icon_mapping.json, ensuring files exist."""
+        """Get every PNG icon discovered in the icons directory."""
         icon_names = []
         project_root = Path(__file__).parent.parent
         icons_dir = project_root / "icons"
@@ -1559,7 +1623,6 @@ Function Details:  {len(loco.function_details)} available
         if not icons_dir.exists():
             return []
         
-        # Only use icons from icon_mapping.json - do not scan file system
         for icon_key, icon_data in self.icon_mapping.items():
             if isinstance(icon_data, dict):
                 # New format: {"path": "...", "filename": "..."}
@@ -1574,8 +1637,7 @@ Function Details:  {len(loco.function_details)} available
                 if file_path.exists():
                     icon_names.append(icon_key)
         
-        # Return sorted list of only mapped icons that exist
-        return sorted(icon_names)
+        return sorted(set(icon_names))
 
     def load_icon_image(self, icon_name: str = None, size: tuple = (80, 80)):
         """Load icon image with black foreground and white background."""

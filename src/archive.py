@@ -96,7 +96,8 @@ class Z21Archive:
             database_path = Path(database_file.name)
 
         try:
-            with sqlite3.connect(database_path) as database:
+            database = sqlite3.connect(database_path)
+            try:
                 integrity = database.execute(
                     "PRAGMA integrity_check").fetchone()
                 if not integrity or integrity[0] != "ok":
@@ -118,5 +119,7 @@ class Z21Archive:
                         "Written locomotive count does not match in-memory "
                         f"data: expected {expected_locomotives}, "
                         f"got {actual_locomotives}")
+            finally:
+                database.close()
         finally:
             database_path.unlink(missing_ok=True)

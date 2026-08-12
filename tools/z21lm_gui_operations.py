@@ -17,6 +17,7 @@ import sqlite3
 import uuid
 import subprocess
 import platform
+import threading
 
 # Add project root to path for data models
 import sys
@@ -24,6 +25,26 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.data_models import Locomotive, FunctionInfo
+from src.categories import CategoryValidationError, parse_categories
+from src.photo_capture import (
+    CaptureMode,
+    ContinuityCameraError,
+    ContinuityCameraService,
+)
+from src.ocr import OCRService
+from src.ai_extraction import DeepSeekFieldExtractor
+from src.function_extraction import (
+    DeepSeekFunctionTableExtractor,
+    historical_button_types,
+    match_function_icon,
+    meaningful_shortcut,
+    missing_function_numbers,
+    order_function_positions,
+)
+from src.credential_store import (
+    CredentialStoreError,
+    DeepSeekCredentialStore,
+)
 
 # Import GUI-related modules (these methods need GUI components)
 # Note: Since this is a Mixin, these imports are needed for the methods to work
@@ -58,6 +79,94 @@ class Z21GUIOperationsMixin:
     functional methods while keeping them separated from GUI layout code.
     All methods assume access to GUI instance attributes via 'self'.
     """
+
+    def open_settings(self):
+        """Configure external services without storing secrets in project files."""
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Settings")
+        dialog.geometry("520x310")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ctk.CTkLabel(
+            dialog,
+            text="External Services",
+            font=ctk.CTkFont(size=18, weight="bold"),
+        ).pack(pady=(20, 12))
+
+        def add_provider(title, description, store, placeholder):
+            frame = ctk.CTkFrame(dialog)
+            frame.pack(fill="x", padx=28, pady=7)
+            ctk.CTkLabel(frame, text=title,
+                         font=ctk.CTkFont(size=15, weight="bold")).pack(
+                             anchor="w", padx=14, pady=(12, 2))
+            try:
+                configured = store.get() is not None
+                status_text = ("API key is saved in macOS Keychain"
+                               if configured else "No API key configured")
+            except CredentialStoreError as error:
+                configured = False
+                status_text = str(error)
+            status_label = ctk.CTkLabel(
+                frame, text=status_text,
+                text_color=("#247a3c" if configured else "gray"))
+            status_label.pack(anchor="w", padx=14)
+            entry = ctk.CTkEntry(frame, show="•", placeholder_text=placeholder)
+            entry.pack(fill="x", padx=14, pady=(6, 5))
+            ctk.CTkLabel(frame, text=description, wraplength=440,
+                         justify="left", text_color="gray").pack(
+                             anchor="w", padx=14)
+            buttons = ctk.CTkFrame(frame, fg_color="transparent")
+            buttons.pack(fill="x", padx=14, pady=(7, 12))
+
+            def save_key():
+                try:
+                    store.set(entry.get())
+                    entry.delete(0, "end")
+                    status_label.configure(
+                        text="API key is saved in macOS Keychain",
+                        text_color="#247a3c")
+                    self.set_status_message(f"{title} key saved securely")
+                except CredentialStoreError as error:
+                    messagebox.showerror("Settings Error", str(error),
+                                         parent=dialog)
+
+            def remove_key():
+                if not messagebox.askyesno(
+                        "Remove API Key",
+                        f"Remove the saved {title} key from macOS Keychain?",
+                        parent=dialog):
+                    return
+                try:
+                    store.delete()
+                    status_label.configure(text="No API key configured",
+                                           text_color="gray")
+                    self.set_status_message(f"{title} key removed")
+                except CredentialStoreError as error:
+                    messagebox.showerror("Settings Error", str(error),
+                                         parent=dialog)
+
+            ctk.CTkButton(buttons, text="Remove", width=82,
+                          command=remove_key, fg_color="#8b3a3a",
+                          hover_color="#6f2e2e").pack(side="left")
+            ctk.CTkButton(buttons, text="Save Key", width=100,
+                          command=save_key).pack(side="right")
+
+        add_provider(
+            "DeepSeek API",
+            "Used for structured OCR-text extraction. Images and keys are never included in prompts.",
+            DeepSeekCredentialStore(), "Enter a new DeepSeek API key")
+
+        ctk.CTkButton(dialog, text="Close", command=dialog.destroy).pack(
+            pady=(8, 14))
+
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() -
+                                  dialog.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() -
+                                  dialog.winfo_height()) // 2
+        dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
 
     def create_new_locomotive(self):
         """Create a new locomotive with empty information."""
@@ -461,6 +570,355 @@ class Z21GUIOperationsMixin:
             self.set_status_message("Error importing JSON file")
 
 
+    def import_from_photo(self):
+        """Choose an iPhone capture mode or import an existing image."""
+        if not self.current_loco:
+            messagebox.showerror("Error", "Please select a locomotive first.")
+            return
+
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Import from Photo")
+        dialog.geometry("460x285")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ctk.CTkLabel(
+            dialog,
+            text="Import locomotive details from a manual",
+            font=ctk.CTkFont(size=17, weight="bold"),
+        ).pack(pady=(22, 8))
+        ctk.CTkLabel(
+            dialog,
+            text=("Document scanning is recommended for automatic edge and "
+                  "perspective correction."),
+            wraplength=400,
+            justify="center",
+        ).pack(pady=(0, 14))
+
+        iphone_state = "normal" if platform.system() == "Darwin" else "disabled"
+        ctk.CTkButton(
+            dialog,
+            text="Scan Document with iPhone (Recommended)",
+            state=iphone_state,
+            command=lambda: self._start_continuity_capture(
+                CaptureMode.SCAN, dialog),
+        ).pack(fill="x", padx=42, pady=4)
+        ctk.CTkButton(
+            dialog,
+            text="Take Photo with iPhone",
+            state=iphone_state,
+            command=lambda: self._start_continuity_capture(
+                CaptureMode.PHOTO, dialog),
+        ).pack(fill="x", padx=42, pady=4)
+        ctk.CTkButton(
+            dialog,
+            text="Choose Existing Image…",
+            command=lambda: self._choose_existing_photo(dialog),
+        ).pack(fill="x", padx=42, pady=4)
+
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() -
+                                  dialog.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() -
+                                  dialog.winfo_height()) // 2
+        dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    def _choose_existing_photo(self, dialog):
+        dialog.destroy()
+        file_path = filedialog.askopenfilename(
+            title="Choose Manual Photo or Scan",
+            filetypes=[
+                ("Images and PDF", "*.png *.jpg *.jpeg *.heic *.tif *.tiff *.pdf"),
+                ("Image files", "*.png *.jpg *.jpeg *.heic *.tif *.tiff"),
+                ("PDF files", "*.pdf"),
+                ("All files", "*.*"),
+            ],
+        )
+        if file_path:
+            self._process_imported_photo(Path(file_path))
+
+    def _start_continuity_capture(self, mode: CaptureMode, dialog):
+        dialog.destroy()
+        self.photo_import_button.configure(state="disabled")
+        action = "Scanning document" if mode == CaptureMode.SCAN else "Taking photo"
+        self.set_status_message(f"{action} with iPhone…", timeout=120000)
+
+        def capture_worker():
+            try:
+                result = ContinuityCameraService().capture(mode)
+                self.root.after(
+                    0, lambda captured=result: self._finish_continuity_capture(
+                        captured, None))
+            except Exception as error:
+                self.root.after(
+                    0, lambda captured_error=error:
+                    self._finish_continuity_capture(None, captured_error))
+
+        threading.Thread(target=capture_worker,
+                         name="continuity-camera",
+                         daemon=True).start()
+
+    def _finish_continuity_capture(self, result, error):
+        self.photo_import_button.configure(state="normal")
+        if error:
+            message = str(error)
+            if isinstance(error, ContinuityCameraError):
+                message += ("\n\nYou can still use Choose Existing Image, or "
+                            "update Xcode Command Line Tools and try again.")
+            messagebox.showerror("Continuity Camera Error", message)
+            self.set_status_message("iPhone capture failed")
+            return
+        if result is None:
+            self.set_status_message("iPhone capture cancelled")
+            return
+        self._process_imported_photo(result.path)
+
+    def _process_imported_photo(self, file_path: Path):
+        """Pass a captured/selected document into the existing OCR preview."""
+        self.last_imported_photo_path = file_path
+        try:
+            self.set_status_message("Extracting text from captured document…",
+                                    timeout=120000)
+            self.root.update_idletasks()
+            extracted_text = self.extract_text_from_file(str(file_path))
+            if not extracted_text.strip():
+                messagebox.showwarning(
+                    "No Text Found",
+                    "The image was imported, but no readable text was found.")
+                self.set_status_message("Photo imported; no text found")
+                return
+            self.show_ocr_result_dialog(extracted_text, str(file_path))
+            self.set_status_message("Photo imported and text extracted")
+        except Exception as error:
+            messagebox.showerror(
+                "Photo Import Error",
+                f"The photo was captured but text extraction failed:\n{error}\n\n"
+                f"Captured file:\n{file_path}")
+            self.set_status_message("Photo imported; extraction failed")
+
+    def scan_functions_from_iphone(self):
+        """Scan a manual function table and propose F-key definitions."""
+        if not self.current_loco:
+            messagebox.showerror("Function Scan",
+                                 "Please select a locomotive first.")
+            return
+        if platform.system() != "Darwin":
+            messagebox.showerror(
+                "Function Scan",
+                "Scan from iPhone requires macOS Continuity Camera.")
+            return
+        try:
+            api_key = DeepSeekCredentialStore().get()
+        except CredentialStoreError as error:
+            messagebox.showerror("DeepSeek Settings", str(error))
+            return
+        if not api_key:
+            messagebox.showwarning(
+                "DeepSeek API Key Required",
+                "Configure a DeepSeek API key in Settings first.")
+            self.open_settings()
+            return
+
+        self.function_scan_button.configure(state="disabled",
+                                            text="Scanning…")
+        self.set_status_message(
+            "Scan the function table with iPhone…", timeout=180000)
+        target_locomotive = self.current_loco
+
+        def worker():
+            try:
+                captured = ContinuityCameraService().capture(CaptureMode.SCAN)
+                if captured is None:
+                    self.root.after(
+                        0, lambda: self._finish_function_scan(
+                            None, None, True, target_locomotive))
+                    return
+                ocr_result = OCRService().recognize(captured.path)
+                available_icons = self.get_available_icons()
+                priors = historical_button_types(
+                    self.z21_data.locomotives if self.z21_data else ())
+                proposals = DeepSeekFunctionTableExtractor(api_key).extract(
+                    ocr_result, available_icons, priors)
+                self.root.after(
+                    0, lambda value=proposals: self._finish_function_scan(
+                        value, None, False, target_locomotive))
+            except Exception as error:
+                self.root.after(
+                    0, lambda value=error: self._finish_function_scan(
+                        None, value, False, target_locomotive))
+
+        threading.Thread(target=worker, name="iphone-function-table-scan",
+                         daemon=True).start()
+
+    def _finish_function_scan(self, proposals, error, cancelled,
+                              target_locomotive):
+        if hasattr(self, "function_scan_button"):
+            self.function_scan_button.configure(
+                state="normal", text="Scan from iphone")
+        if cancelled:
+            self.set_status_message("Function table scan cancelled")
+            return
+        if error:
+            messagebox.showerror(
+                "Function Scan Error",
+                f"The function table could not be extracted:\n{error}")
+            self.set_status_message("Function table scan failed")
+            return
+        if self.current_loco is not target_locomotive:
+            messagebox.showwarning(
+                "Locomotive Changed",
+                "The selected locomotive changed during scanning. Select the "
+                "intended locomotive and scan the function table again.")
+            self.set_status_message("Function scan discarded after selection changed")
+            return
+        self.set_status_message(
+            f"Found {len(proposals)} function-key row(s)")
+        self._show_function_scan_review(proposals)
+
+    def _show_function_scan_review(self, proposals):
+        """Let the user verify F numbers, names, icons, and button behavior."""
+        if not self.current_loco:
+            return
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Review Scanned Functions")
+        dialog.geometry("1040x680")
+        dialog.minsize(820, 480)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ctk.CTkLabel(
+            dialog, text="Review Scanned Function Table",
+            font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(15, 3))
+        ctk.CTkLabel(
+            dialog,
+            text=("Verify the function number and matched icon. Existing F keys "
+                  "are unchecked to prevent accidental replacement."),
+            text_color="gray").pack(pady=(0, 9))
+        gaps = missing_function_numbers(
+            proposal.number for proposal in proposals)
+        if gaps:
+            ctk.CTkLabel(
+                dialog,
+                text=("Possible missing rows in the scanned sequence: " +
+                      ", ".join(f"F{number}" for number in gaps) +
+                      ". Check the scan before applying."),
+                text_color="#a66a00").pack(pady=(0, 7))
+
+        rows = ctk.CTkScrollableFrame(dialog)
+        rows.pack(fill="both", expand=True, padx=14, pady=6)
+        rows.grid_columnconfigure(2, weight=1)
+        headers = ("Use", "F key", "Function from manual", "Matched icon",
+                   "Button", "Confidence")
+        for column, title in enumerate(headers):
+            ctk.CTkLabel(rows, text=title,
+                         font=ctk.CTkFont(weight="bold")).grid(
+                             row=0, column=column, padx=5, pady=5,
+                             sticky="w")
+
+        icon_options = self.get_available_icons()
+        button_names = ("Switch", "Push button", "Timed")
+        review_rows = []
+        for row_index, proposal in enumerate(proposals, start=1):
+            selected = ctk.BooleanVar(
+                value=(proposal.number not in
+                       self.current_loco.function_details and
+                       proposal.confidence >= .70))
+            number = ctk.StringVar(value=f"F{proposal.number}")
+            name = ctk.StringVar(value=proposal.name)
+            icon = ctk.StringVar(value=proposal.icon_name)
+            button = ctk.StringVar(value=button_names[proposal.button_type])
+            review_rows.append((selected, number, name, icon, button,
+                                proposal))
+            ctk.CTkCheckBox(rows, text="", variable=selected, width=28).grid(
+                row=row_index, column=0, padx=5, pady=7)
+            ctk.CTkEntry(rows, textvariable=number, width=62).grid(
+                row=row_index, column=1, padx=5, pady=7)
+            ctk.CTkEntry(rows, textvariable=name, width=310).grid(
+                row=row_index, column=2, padx=5, pady=7, sticky="ew")
+            ctk.CTkOptionMenu(rows, variable=icon, values=icon_options,
+                              width=185).grid(
+                                  row=row_index, column=3, padx=5, pady=7)
+            ctk.CTkOptionMenu(rows, variable=button,
+                              values=list(button_names), width=125).grid(
+                                  row=row_index, column=4, padx=5, pady=7)
+            ctk.CTkLabel(
+                rows, text=f"{proposal.confidence:.0%}", width=65,
+                text_color=("#247a3c" if proposal.confidence >= .85 else
+                            "#a66a00" if proposal.confidence >= .70 else
+                            "#9b2c2c")).grid(
+                                row=row_index, column=5, padx=5, pady=7)
+
+        buttons = ctk.CTkFrame(dialog, fg_color="transparent")
+        buttons.pack(fill="x", padx=14, pady=(5, 14))
+
+        def apply_selected():
+            chosen = []
+            seen = set()
+            for selected, number_var, name_var, icon_var, button_var, _ in review_rows:
+                if not selected.get():
+                    continue
+                match = re.fullmatch(r"F?\s*(\d{1,2})",
+                                     number_var.get().strip(), re.IGNORECASE)
+                if not match or not 0 <= int(match.group(1)) <= 32:
+                    messagebox.showerror(
+                        "Invalid Function Number",
+                        f"'{number_var.get()}' must be between F0 and F32.",
+                        parent=dialog)
+                    return
+                number_value = int(match.group(1))
+                if number_value in seen:
+                    messagebox.showerror(
+                        "Duplicate Function Number",
+                        f"F{number_value} is selected more than once.",
+                        parent=dialog)
+                    return
+                seen.add(number_value)
+                chosen.append((number_value, name_var.get().strip(),
+                               icon_var.get(), button_var.get()))
+
+            if not chosen:
+                messagebox.showinfo("Function Scan",
+                                    "No functions were selected.",
+                                    parent=dialog)
+                return
+            next_position = max(
+                (item.position for item in
+                 self.current_loco.function_details.values()), default=-1) + 1
+            for number_value, name_value, icon_value, button_value in chosen:
+                button_type = button_names.index(button_value)
+                existing = self.current_loco.function_details.get(number_value)
+                if existing:
+                    existing.image_name = icon_value
+                    existing.shortcut = self.generate_shortcut(
+                        name_value, icon_value)
+                    existing.button_type = button_type
+                    existing.is_active = True
+                else:
+                    self.current_loco.function_details[number_value] = FunctionInfo(
+                        function_number=number_value,
+                        image_name=icon_value,
+                        shortcut=self.generate_shortcut(name_value, icon_value),
+                        position=next_position,
+                        time="0", button_type=button_type, is_active=True)
+                    next_position += 1
+                self.current_loco.functions[number_value] = True
+            order_function_positions(self.current_loco.function_details)
+            dialog.destroy()
+            self.update_functions(force=True)
+            self.update_overview()
+            self.set_status_message(
+                f"Applied {len(chosen)} scanned function(s); save changes to persist")
+            messagebox.showinfo(
+                "Functions Applied",
+                f"Applied {len(chosen)} function(s). Click Save Changes to write them to the Z21 file.")
+
+        ctk.CTkButton(buttons, text="Cancel", command=dialog.destroy).pack(
+            side="right", padx=(8, 0))
+        ctk.CTkButton(buttons, text="Apply Selected",
+                      command=apply_selected).pack(side="right")
+
+
     def load_from_json_file(self, file_path: Path):
         """Load locomotive details from a JSON file and fill fields (only non-empty values)."""
         try:
@@ -785,6 +1243,20 @@ class Z21GUIOperationsMixin:
         # File path label
         file_label = ctk.CTkLabel(main_frame, text=f"File: {Path(file_path).name}", font=("Arial", 10), text_color="gray")
         file_label.pack(pady=(0, 10))
+
+        ocr_result = getattr(self, "last_ocr_result", None)
+        if ocr_result is not None:
+            confidence = ocr_result.average_confidence
+            confidence_text = (
+                f" · average confidence {confidence:.1%}"
+                if confidence is not None else "")
+            engine_label = ctk.CTkLabel(
+                main_frame,
+                text=f"Engine: {ocr_result.engine}{confidence_text}",
+                font=("Arial", 10),
+                text_color="gray",
+            )
+            engine_label.pack(pady=(0, 10))
         
         # Scrollable text area
         text_frame = ctk.CTkFrame(main_frame)
@@ -801,7 +1273,7 @@ class Z21GUIOperationsMixin:
         
         def fill_fields():
             """Fill fields with extracted text and close dialog."""
-            self.parse_and_fill_fields(extracted_text)
+            self.parse_and_fill_fields(text_widget.get("1.0", "end").strip())
             dialog.destroy()
             messagebox.showinfo("Success", "Details extracted and filled from document!")
         
@@ -809,6 +1281,15 @@ class Z21GUIOperationsMixin:
             """Close dialog without filling fields."""
             dialog.destroy()
         
+        analyze_button = ctk.CTkButton(
+            button_frame,
+            text="Analyze with DeepSeek",
+            command=lambda: self._analyze_with_deepseek(
+                text_widget.get("1.0", "end").strip(), dialog,
+                analyze_button),
+            width=165,
+        )
+        analyze_button.pack(side="left")
         ctk.CTkButton(button_frame, text="Fill Fields", command=fill_fields, width=120).pack(side="right", padx=(5, 0))
         ctk.CTkButton(button_frame, text="Cancel", command=cancel, width=120).pack(side="right", padx=(5, 0))
         
@@ -818,43 +1299,216 @@ class Z21GUIOperationsMixin:
         y = (dialog.winfo_screenheight() // 2) - (dialog.winfo_height() // 2)
         dialog.geometry(f"+{x}+{y}")
 
+    def _current_ai_fields(self):
+        max_speed = self.speed_var.get().strip()
+        return {
+            "name": self.name_var.get().strip(),
+            "full_name": self.full_name_var.get().strip(),
+            "railway": self.railway_var.get().strip(),
+            "article_number": self.article_number_var.get().strip(),
+            "decoder_type": self.decoder_type_var.get().strip(),
+            "build_year": self.build_year_var.get().strip(),
+            "model_buffer_length": self.model_buffer_length_var.get().strip(),
+            "service_weight": self.service_weight_var.get().strip(),
+            "model_weight": self.model_weight_var.get().strip(),
+            "rmin": self.rmin_var.get().strip(),
+            "drivers_cab": self.drivers_cab_var.get().strip(),
+            "max_speed": "" if max_speed == "0" else max_speed,
+            "categories": self.categories_var.get().strip(),
+            "description": self.description_text.get("1.0", "end").strip(),
+        }
+
+    def _analyze_with_deepseek(self, ocr_text, source_dialog,
+                               analyze_button):
+        try:
+            api_key = DeepSeekCredentialStore().get()
+        except CredentialStoreError as error:
+            messagebox.showerror("DeepSeek Settings", str(error),
+                                 parent=source_dialog)
+            return
+        if not api_key:
+            messagebox.showwarning(
+                "DeepSeek API Key Required",
+                "Configure a DeepSeek API key in Settings first.",
+                parent=source_dialog)
+            self.open_settings()
+            return
+
+        analyze_button.configure(state="disabled", text="Analyzing…")
+        self.set_status_message("DeepSeek is analyzing OCR text…",
+                                timeout=120000)
+        current_fields = self._current_ai_fields()
+
+        def worker():
+            try:
+                result = DeepSeekFieldExtractor(api_key).extract(
+                    ocr_text, current_fields)
+                self.root.after(
+                    0, lambda value=result: self._finish_deepseek_analysis(
+                        value, None, source_dialog, analyze_button,
+                        current_fields))
+            except Exception as error:
+                self.root.after(
+                    0, lambda value=error: self._finish_deepseek_analysis(
+                        None, value, source_dialog, analyze_button,
+                        current_fields))
+
+        threading.Thread(target=worker, name="deepseek-field-extraction",
+                         daemon=True).start()
+
+    def _finish_deepseek_analysis(self, result, error, source_dialog,
+                                  analyze_button, current_fields):
+        if source_dialog.winfo_exists():
+            analyze_button.configure(state="normal",
+                                     text="Analyze with DeepSeek")
+        if error:
+            messagebox.showerror("DeepSeek Analysis Error", str(error),
+                                 parent=source_dialog)
+            self.set_status_message("DeepSeek analysis failed")
+            return
+        self.set_status_message(
+            f"DeepSeek proposed {len(result.proposals)} field(s)")
+        self._show_deepseek_review(result, current_fields, source_dialog)
+
+    def _show_deepseek_review(self, result, current_fields,
+                              source_dialog=None):
+        parent = source_dialog if source_dialog is not None else self.root
+        if not result.proposals:
+            messagebox.showinfo(
+                "DeepSeek Analysis",
+                "No supported fields could be extracted with evidence.",
+                parent=parent)
+            return
+
+        labels = {
+            "name": "Name", "full_name": "Full Name",
+            "railway": "Railway", "article_number": "Article Number",
+            "decoder_type": "Decoder Type", "build_year": "Build Year",
+            "model_buffer_length": "Buffer Length",
+            "service_weight": "Service Weight",
+            "model_weight": "Model Weight", "rmin": "Minimum Radius",
+            "drivers_cab": "Driver's Cab", "max_speed": "Max Speed",
+            "categories": "Categories", "description": "Description",
+        }
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Review DeepSeek Suggestions")
+        dialog.geometry("900x650")
+        dialog.minsize(720, 480)
+        dialog.transient(parent)
+        dialog.grab_set()
+
+        ctk.CTkLabel(
+            dialog,
+            text="Review DeepSeek Suggestions",
+            font=ctk.CTkFont(size=18, weight="bold"),
+        ).pack(pady=(16, 4))
+        ctk.CTkLabel(
+            dialog,
+            text=("Only checked fields will be applied. Existing values are "
+                  "not selected by default."),
+            text_color="gray",
+        ).pack(pady=(0, 10))
+
+        rows = ctk.CTkScrollableFrame(dialog)
+        rows.pack(fill="both", expand=True, padx=14, pady=8)
+        rows.grid_columnconfigure(2, weight=1)
+        selections = []
+
+        headers = ("Use", "Field", "Proposed value", "Confidence / evidence")
+        for column, title in enumerate(headers):
+            ctk.CTkLabel(rows, text=title,
+                         font=ctk.CTkFont(weight="bold")).grid(
+                             row=0, column=column, padx=6, pady=5,
+                             sticky="w")
+
+        for row_index, proposal in enumerate(result.proposals, start=1):
+            current = current_fields.get(proposal.field, "")
+            selected = ctk.BooleanVar(
+                value=(not current and proposal.confidence >= 0.70))
+            selections.append((selected, proposal))
+            ctk.CTkCheckBox(rows, text="", variable=selected, width=30).grid(
+                row=row_index, column=0, padx=6, pady=8, sticky="nw")
+            ctk.CTkLabel(rows, text=labels.get(proposal.field,
+                                              proposal.field),
+                         width=125, anchor="w").grid(
+                             row=row_index, column=1, padx=6, pady=8,
+                             sticky="nw")
+            value_text = proposal.value
+            if current:
+                value_text = f"Current: {current}\nProposed: {proposal.value}"
+            ctk.CTkLabel(rows, text=value_text, wraplength=300,
+                         justify="left", anchor="w").grid(
+                             row=row_index, column=2, padx=6, pady=8,
+                             sticky="new")
+            page_text = f" · page {proposal.page}" if proposal.page else ""
+            detail = (f"{proposal.confidence:.0%}{page_text}\n"
+                      f"Evidence: {proposal.evidence or 'not verified'}")
+            color = ("#247a3c" if proposal.confidence >= 0.85 else
+                     "#a66a00" if proposal.confidence >= 0.70 else "#9b2c2c")
+            ctk.CTkLabel(rows, text=detail, wraplength=310,
+                         justify="left", anchor="w",
+                         text_color=color).grid(
+                             row=row_index, column=3, padx=6, pady=8,
+                             sticky="new")
+
+        buttons = ctk.CTkFrame(dialog, fg_color="transparent")
+        buttons.pack(fill="x", padx=14, pady=(4, 14))
+
+        def apply_selected():
+            applied = 0
+            for selected, proposal in selections:
+                if selected.get():
+                    self._apply_ai_proposal(proposal.field, proposal.value)
+                    applied += 1
+            dialog.destroy()
+            if source_dialog is not None and source_dialog.winfo_exists():
+                source_dialog.destroy()
+            self.set_status_message(
+                f"Applied {applied} DeepSeek field suggestion(s)")
+            messagebox.showinfo(
+                "Suggestions Applied",
+                f"Applied {applied} field(s). Review them, then click Save Changes.")
+
+        ctk.CTkButton(buttons, text="Cancel", command=dialog.destroy).pack(
+            side="right", padx=(8, 0))
+        ctk.CTkButton(buttons, text="Apply Selected",
+                      command=apply_selected).pack(side="right")
+
+    def _apply_ai_proposal(self, field, value):
+        variables = {
+            "name": self.name_var,
+            "full_name": self.full_name_var,
+            "railway": self.railway_var,
+            "article_number": self.article_number_var,
+            "decoder_type": self.decoder_type_var,
+            "build_year": self.build_year_var,
+            "model_buffer_length": self.model_buffer_length_var,
+            "service_weight": self.service_weight_var,
+            "model_weight": self.model_weight_var,
+            "rmin": self.rmin_var,
+            "drivers_cab": self.drivers_cab_var,
+            "max_speed": self.speed_var,
+            "categories": self.categories_var,
+        }
+        if field == "description":
+            self.description_text.delete("1.0", "end")
+            self.description_text.insert("1.0", value)
+        elif field in variables:
+            variables[field].set(value)
+
 
     def extract_text_from_file(self, file_path: str) -> str:
-        """Extract text from image or PDF using OCR (pytesseract)."""
+        """Extract text with Apple Vision, retaining structured OCR results."""
         # Ensure file_path is a string (not a tuple, list, or other type)
         if isinstance(file_path, (list, tuple)):
             file_path = file_path[0] if len(file_path) > 0 else str(file_path)
         elif not isinstance(file_path, (str, Path)):
             file_path = str(file_path)
         
-        file_path_obj = Path(file_path)
-        
         try:
-            import pytesseract
-        except ImportError:
-            messagebox.showerror("Missing Dependency", "pytesseract is required for OCR.\nPlease install it with: pip install pytesseract")
-            return ""
-
-        try:
-            if file_path_obj.suffix.lower() == ".pdf":
-                try:
-                    from pdf2image import convert_from_path
-                except ImportError:
-                    messagebox.showerror("Missing Dependency", "pdf2image is required for PDF processing.")
-                    return ""
-                images = convert_from_path(str(file_path_obj))
-                text_parts = []
-                for image in images:
-                    text = pytesseract.image_to_string(image)
-                    text_parts.append(text)
-                return "\n".join(text_parts)
-            else:
-                if not HAS_PIL:
-                    messagebox.showerror("Error", "PIL/Pillow is required for image processing.")
-                    return ""
-                # Ensure we pass a string to Image.open()
-                image = Image.open(str(file_path_obj))
-                return pytesseract.image_to_string(image) or ""
+            result = OCRService().recognize(Path(file_path))
+            self.last_ocr_result = result
+            return result.text
         except Exception as e:
             raise Exception(f"OCR failed: {e}")
 
@@ -1205,7 +1859,7 @@ class Z21GUIOperationsMixin:
                     continue
 
                 func_name = func_data.get("name", "").strip() or f"Function {func_num}"
-                shortcut = func_data.get("shortcut", "").strip() or self.generate_shortcut(func_name)
+                supplied_shortcut = func_data.get("shortcut", "").strip()
                 icon_val = func_data.get("icon", "").strip()
                 icon_name = ""
 
@@ -1233,6 +1887,9 @@ class Z21GUIOperationsMixin:
 
                 if not icon_name:
                     icon_name = "neutral" if "neutral" in self.icon_mapping else "neutral_Normal.png"
+
+                shortcut = (supplied_shortcut or
+                            self.generate_shortcut(func_name, icon_name))
 
                 func_type = func_data.get("type", "switch").lower().strip()
                 button_type = 0
@@ -1276,79 +1933,14 @@ class Z21GUIOperationsMixin:
             self.set_status_message("Failed to scan functions from JSON")
 
 
-    def generate_shortcut(self, func_name: str) -> str:
-        """Generate a keyboard shortcut for a function name."""
-        func_name_lower = func_name.lower().strip()
-        shortcut_map = {
-            "light": "L", "horn": "H", "bell": "B", "whistle": "W", "sound": "S", "steam": "S",
-            "brake": "B", "couple": "C", "decouple": "D", "door": "D", "fan": "F", "pump": "P",
-            "valve": "V", "generator": "G", "compressor": "C", "neutral": "N", "forward": "F",
-            "backward": "B", "interior": "I", "cabin": "C", "cockpit": "C",
-        }
-        for key, shortcut in shortcut_map.items():
-            if key in func_name_lower:
-                return shortcut
-        if func_name_lower and func_name_lower[0].isalpha():
-            return func_name_lower[0].upper()
-        return ""
+    def generate_shortcut(self, func_name: str, icon_name: str = "") -> str:
+        """Generate a meaningful 5–8 character function label."""
+        return meaningful_shortcut(func_name, icon_name)
 
 
     def match_function_to_icon(self, func_name: str) -> str:
-        """Match a function name to an icon using fuzzy matching."""
-        func_name_lower = func_name.lower().strip()
-        icon_names = list(self.icon_mapping.keys())
-        keyword_map = {
-            "light": ["light", "lamp", "beam", "sidelight", "interior_light", "cabin_light"],
-            "horn": ["horn", "horn_high", "horn_low", "horn_two_sound"],
-            "bell": ["bell"],
-            "whistle": ["whistle", "whistle_long", "whistle_short"],
-            "sound": ["sound", "sound1", "sound2", "sound3", "sound4"],
-            "steam": ["steam", "dump_steam"],
-            "brake": ["brake", "brake_delay", "sound_brake", "handbrake"],
-            "couple": ["couple"],
-            "decouple": ["decouple"],
-            "door": ["door", "door_open", "door_close"],
-            "fan": ["fan", "fan_strong", "blower"],
-            "pump": ["pump", "feed_pump", "air_pump"],
-            "valve": ["valve", "drain_valve"],
-            "generator": ["generator", "diesel_generator"],
-            "compressor": ["compressor"],
-            "neutral": ["neutral"],
-            "forward": ["forward", "forward_take_power"],
-            "backward": ["backward", "backward_take_power"],
-            "interior": ["interior_light"],
-            "cabin": ["cabin_light"],
-            "cockpit": ["cockpit_light_left", "cockpit_light_right"],
-            "drain": ["drain", "drainage", "drain_mud", "drain_valve"],
-            "diesel": ["diesel", "diesel_generator", "diesel_regulation"],
-            "rail": ["rail", "rail_kick", "rail_crossing"],
-            "scoop": ["scoop", "scoop_coal"],
-            "firebox": ["firebox"],
-            "injector": ["injector"],
-            "preheat": ["preheat"],
-            "mute": ["mute"],
-            "louder": ["louder"],
-            "quiter": ["quiter"],
-        }
-
-        for keyword, icon_candidates in keyword_map.items():
-            if keyword in func_name_lower:
-                for candidate in icon_candidates:
-                    if candidate in icon_names: return candidate
-                for icon_name in icon_names:
-                    for candidate in icon_candidates:
-                        if candidate in icon_name: return icon_name
-
-        func_words = set(re.findall(r"\b\w+\b", func_name_lower))
-        best_match, best_score = None, 0
-        for icon_name in icon_names:
-            icon_words = set(re.findall(r"\b\w+\b", icon_name.lower()))
-            overlap = len(func_words & icon_words)
-            if overlap > best_score:
-                best_score = overlap
-                best_match = icon_name
-        
-        return best_match if best_match and best_score > 0 else (icon_names[0] if icon_names else "")
+        """Match a function name through the shared multilingual icon catalog."""
+        return match_function_icon(func_name, self.get_available_icons())
 
 
     def match_icon_name_to_mapping(self, icon_name: str) -> str:
@@ -1442,7 +2034,8 @@ class Z21GUIOperationsMixin:
             self.current_loco.regulation_step = regulation_step_map.get(self.regulation_step_var.get(), 0)
 
             categories_str = self.categories_var.get().strip()
-            self.current_loco.categories = [cat.strip() for cat in categories_str.split(",") if cat.strip()] if categories_str else []
+            self.current_loco.categories = list(parse_categories(
+                categories_str)) if categories_str else []
 
             if self.current_loco_index is not None:
                 self.z21_data.locomotives[self.current_loco_index] = self.current_loco
@@ -1450,14 +2043,22 @@ class Z21GUIOperationsMixin:
                 messagebox.showerror("Error", "Could not find locomotive in data structure.")
                 return
 
+            write_succeeded = False
             try:
                 self.parser.write(self.z21_data, self.z21_file)
-                self.set_status_message("Locomotive details saved successfully to file!")
+                write_succeeded = True
             except Exception as write_error:
                 self.set_status_message(f"Failed to write changes to file: {write_error}. Changes saved in memory but not written to disk.")
 
+            if write_succeeded:
+                self.set_status_message(
+                    "Locomotive details saved successfully to file!")
+
             self.populate_list(self.search_var.get() if hasattr(self, "search_var") else "", preserve_selection=True)
 
+        except CategoryValidationError as e:
+            messagebox.showerror("Invalid Category", str(e))
+            self.set_status_message(str(e), timeout=12000)
         except ValueError as e:
             self.set_status_message(f"Invalid input: {e}. Please enter valid numbers for Address and Max Speed.")
         except Exception as e:

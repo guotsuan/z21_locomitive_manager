@@ -127,12 +127,15 @@ class PersistenceRegressionTests(unittest.TestCase):
 
         database_path = self.work_dir / "validated.sqlite"
         database_path.write_bytes(sqlite_bytes)
-        with sqlite3.connect(database_path) as database:
+        database = sqlite3.connect(database_path)
+        try:
             self.assertEqual(
                 database.execute("PRAGMA integrity_check").fetchone()[0],
                 "ok")
             self.assertEqual(
                 database.execute("PRAGMA user_version").fetchone()[0], 16)
+        finally:
+            database.close()
 
 
 if __name__ == "__main__":
