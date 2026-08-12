@@ -9,13 +9,14 @@ These methods are designed to be mixed into the Z21GUI class using the Mixin pat
 
 from pathlib import Path
 from typing import Optional
+import copy
 import json
+import logging
 import re
 import tempfile
 import zipfile
 import sqlite3
 import uuid
-import subprocess
 import platform
 import threading
 
@@ -31,7 +32,7 @@ from src.photo_capture import (
     ContinuityCameraError,
     ContinuityCameraService,
 )
-from src.ocr import OCRService
+from src.ocr import OCRCancelledError, OCRService
 from src.ai_extraction import DeepSeekFieldExtractor
 from src.function_extraction import (
     DeepSeekFunctionTableExtractor,
@@ -45,6 +46,11 @@ from src.credential_store import (
     CredentialStoreError,
     DeepSeekCredentialStore,
 )
+from src.form_validation import (
+    LocomotiveValidationError,
+    validate_locomotive_form,
+)
+from src.platform_adapter import PlatformFeatureUnavailable
 
 # Import GUI-related modules (these methods need GUI components)
 # Note: Since this is a Mixin, these imports are needed for the methods to work
@@ -62,13 +68,7 @@ try:
 except ImportError:
     HAS_PIL = False
 
-# Try to import PyObjC for macOS sharing
-try:
-    from AppKit import NSSharingService, NSURL, NSArray, NSWorkspace
-    from Foundation import NSFileManager
-    HAS_PYOBJC = True
-except ImportError:
-    HAS_PYOBJC = False
+logger = logging.getLogger(__name__)
 
 
 class Z21GUIOperationsMixin:
@@ -173,6 +173,8 @@ class Z21GUIOperationsMixin:
         if not self.z21_data:
             self.set_status_message("Error: No Z21 data loaded.")
             return
+        if self.current_loco is not None and not self.confirm_pending_changes():
+            return
 
         used_addresses = {loco.address for loco in self.z21_data.locomotives}
         new_address = 1
@@ -207,6 +209,8 @@ class Z21GUIOperationsMixin:
         self.notebook.set("Overview")
         self.root.after(100, lambda: self.name_entry.focus())
         self.update_status_count()
+        self._pending_new_locomotive = new_loco
+        self._force_dirty = True
         self.set_status_message(f"Created new locomotive with address {new_address}. You can now edit the details.")
 
 
@@ -214,6 +218,11 @@ class Z21GUIOperationsMixin:
         """Delete the currently selected locomotive."""
         if not self.current_loco or not self.z21_data:
             self.set_status_message("No locomotive selected.")
+            return
+        if not self.confirm_pending_changes():
+            return
+        if not self.current_loco:
+            self.populate_list(self.search_var.get(), auto_select_first=True)
             return
 
         loco_display = f"Address {self.current_loco.address:4d} - {self.current_loco.name}"
@@ -462,17 +471,14 @@ class Z21GUIOperationsMixin:
                     self.current_loco.image_name = new_image_name
                     if self.current_loco_index is not None:
                         self.z21_data.locomotives[self.current_loco_index] = self.current_loco
-
-                    self.parser.write(self.z21_data, self.z21_file)
-                    with zipfile.ZipFile(self.z21_file, "a") as zf:
-                        if new_image_name not in zf.namelist():
-                            zf.write(tmp_path, new_image_name)
-
-                    tmp_path.unlink()
+                    self._pending_archive_members[new_image_name] = tmp_path.read_bytes()
+                    tmp_path.unlink(missing_ok=True)
                     self.update_details()
                     crop_window.destroy()
-                    self.set_status_message("Locomotive image updated successfully!")
+                    self.set_status_message(
+                        "Image updated; click Save Changes to write it to the file.")
                 except Exception as e:
+                    logger.exception("Unable to stage cropped locomotive image")
                     messagebox.showerror("Error", f"Failed to save cropped image: {e}")
 
             # Center the buttons in a container
@@ -543,7 +549,7 @@ class Z21GUIOperationsMixin:
 
 
     def scan_for_details(self):
-        """Import locomotive details from a JSON file and auto-fill fields."""
+        """Preview JSON field changes before applying them to the form."""
         if not self.current_loco:
             messagebox.showerror("Error", "Please select a locomotive first.")
             return
@@ -559,15 +565,67 @@ class Z21GUIOperationsMixin:
             return
 
         file_path_obj = Path(file_path)
-        
+        before_loco = copy.deepcopy(self.current_loco)
+        before_fields = self._import_preview_fields()
         try:
             self.status_label.configure(text="Reading JSON file...")
-            self.root.update()
-            self.load_from_json_file(file_path_obj)
-            self.set_status_message("Details imported from JSON file successfully!")
+            self.root.update_idletasks()
+            if not self.load_from_json_file(file_path_obj):
+                self.set_status_message("JSON import cancelled")
+                return
+            after_fields = self._import_preview_fields()
+            changes = [
+                f"{label}: {before_fields[label] or '—'}  →  {value or '—'}"
+                for label, value in after_fields.items()
+                if value != before_fields[label]
+            ]
+            if not changes:
+                messagebox.showinfo("Import Preview",
+                                    "The file contains no applicable changes.")
+                return
+            preview = "\n".join(changes[:14])
+            if len(changes) > 14:
+                preview += f"\n…and {len(changes) - 14} more field(s)"
+            if not messagebox.askyesno(
+                    "Import Preview",
+                    f"Apply these changes?\n\n{preview}", parent=self.root):
+                self.current_loco = before_loco
+                if self.current_loco_index is not None:
+                    self.z21_data.locomotives[
+                        self.current_loco_index] = before_loco
+                self.update_overview()
+                self.set_status_message("JSON import discarded")
+                return
+            self.set_status_message(
+                f"Applied {len(changes)} imported field change(s); save to persist")
         except Exception as e:
+            logger.exception("JSON import failed for %s", file_path_obj)
+            self.current_loco = before_loco
+            if self.current_loco_index is not None:
+                self.z21_data.locomotives[self.current_loco_index] = before_loco
+            self.update_overview()
             messagebox.showerror("Error", f"Failed to import JSON file: {e}")
             self.set_status_message("Error importing JSON file")
+
+    def _import_preview_fields(self):
+        return {
+            "Name": self.name_var.get().strip(),
+            "Address": self.address_var.get().strip(),
+            "Max Speed": self.speed_var.get().strip(),
+            "Full Name": self.full_name_var.get().strip(),
+            "Railway": self.railway_var.get().strip(),
+            "Article Number": self.article_number_var.get().strip(),
+            "Decoder Type": self.decoder_type_var.get().strip(),
+            "Build Year": self.build_year_var.get().strip(),
+            "Buffer Length": self.model_buffer_length_var.get().strip(),
+            "Service Weight": self.service_weight_var.get().strip(),
+            "Model Weight": self.model_weight_var.get().strip(),
+            "Minimum Radius": self.rmin_var.get().strip(),
+            "IP Address": self.ip_var.get().strip(),
+            "Driver's Cab": self.drivers_cab_var.get().strip(),
+            "Categories": self.categories_var.get().strip(),
+            "Description": self.description_text.get("1.0", "end").strip(),
+        }
 
 
     def import_from_photo(self):
@@ -675,27 +733,105 @@ class Z21GUIOperationsMixin:
         self._process_imported_photo(result.path)
 
     def _process_imported_photo(self, file_path: Path):
-        """Pass a captured/selected document into the existing OCR preview."""
+        """Run document OCR without blocking Tk's event loop."""
         self.last_imported_photo_path = file_path
-        try:
-            self.set_status_message("Extracting text from captured document…",
-                                    timeout=120000)
-            self.root.update_idletasks()
-            extracted_text = self.extract_text_from_file(str(file_path))
-            if not extracted_text.strip():
-                messagebox.showwarning(
-                    "No Text Found",
-                    "The image was imported, but no readable text was found.")
-                self.set_status_message("Photo imported; no text found")
-                return
-            self.show_ocr_result_dialog(extracted_text, str(file_path))
-            self.set_status_message("Photo imported and text extracted")
-        except Exception as error:
+        self._start_ocr_task(file_path, self._finish_photo_ocr)
+
+    def _start_ocr_task(self, file_path: Path, completion):
+        """Start OCR in a worker and show an indeterminate, cancellable dialog."""
+        if getattr(self, "_ocr_cancel_event", None) is not None:
+            messagebox.showinfo("OCR in Progress",
+                                "Another OCR task is already running.")
+            return
+
+        cancel_event = threading.Event()
+        self._ocr_cancel_event = cancel_event
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Reading Document")
+        dialog.geometry("430x175")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        ctk.CTkLabel(dialog, text="Recognizing text…",
+                     font=ctk.CTkFont(size=16, weight="bold")).pack(
+                         pady=(24, 8))
+        detail_label = ctk.CTkLabel(
+            dialog,
+            text=f"Processing {file_path.name}. Multi-page files may take a while.",
+            wraplength=380,
+        )
+        detail_label.pack(pady=(0, 10))
+        progress = ctk.CTkProgressBar(dialog, mode="indeterminate", width=330)
+        progress.pack(pady=(0, 14))
+        progress.start()
+
+        def request_cancel():
+            cancel_event.set()
+            detail_label.configure(
+                text="Cancelling… the current page will finish at a safe point.")
+            cancel_button.configure(state="disabled")
+
+        cancel_button = ctk.CTkButton(dialog, text="Cancel", width=100,
+                                      command=request_cancel)
+        cancel_button.pack()
+        dialog.protocol("WM_DELETE_WINDOW", request_cancel)
+        self.set_status_message("OCR is running in the background…",
+                                timeout=180000)
+
+        def worker():
+            result = None
+            error = None
+            try:
+                if not cancel_event.is_set():
+                    result = OCRService().recognize(
+                        file_path, cancel_event=cancel_event)
+            except OCRCancelledError as task_error:
+                error = task_error
+                logger.info("OCR cancelled for %s", file_path)
+            except Exception as task_error:
+                error = task_error
+                logger.exception("OCR failed for %s", file_path)
+            try:
+                self.root.after(
+                    0, lambda: self._finish_ocr_task(
+                        dialog, progress, cancel_event, result, error,
+                        file_path, completion))
+            except RuntimeError:
+                logger.debug("Application closed before OCR completion")
+
+        threading.Thread(target=worker, name="document-ocr",
+                         daemon=True).start()
+
+    def _finish_ocr_task(self, dialog, progress, cancel_event, result, error,
+                         file_path, completion):
+        self._ocr_cancel_event = None
+        progress.stop()
+        if dialog.winfo_exists():
+            dialog.grab_release()
+            dialog.destroy()
+        if cancel_event.is_set():
+            self.set_status_message("OCR cancelled")
+            return
+        completion(file_path, result, error)
+
+    def _finish_photo_ocr(self, file_path, result, error):
+        if error is not None:
             messagebox.showerror(
                 "Photo Import Error",
                 f"The photo was captured but text extraction failed:\n{error}\n\n"
                 f"Captured file:\n{file_path}")
             self.set_status_message("Photo imported; extraction failed")
+            return
+        self.last_ocr_result = result
+        extracted_text = result.text if result is not None else ""
+        if not extracted_text.strip():
+            messagebox.showwarning(
+                "No Text Found",
+                "The image was imported, but no readable text was found.")
+            self.set_status_message("Photo imported; no text found")
+            return
+        self.show_ocr_result_dialog(extracted_text, str(file_path))
+        self.set_status_message("Photo imported and text extracted")
 
     def scan_functions_from_iphone(self):
         """Scan a manual function table and propose F-key definitions."""
@@ -725,16 +861,49 @@ class Z21GUIOperationsMixin:
         self.set_status_message(
             "Scan the function table with iPhone…", timeout=180000)
         target_locomotive = self.current_loco
+        cancel_event = threading.Event()
+        progress_dialog = ctk.CTkToplevel(self.root)
+        progress_dialog.title("Scanning Function Table")
+        progress_dialog.geometry("430x175")
+        progress_dialog.resizable(False, False)
+        progress_dialog.transient(self.root)
+        progress_dialog.grab_set()
+        progress_label = ctk.CTkLabel(
+            progress_dialog, text="Waiting for the iPhone scan…",
+            wraplength=380)
+        progress_label.pack(pady=(28, 12))
+        progress = ctk.CTkProgressBar(progress_dialog,
+                                      mode="indeterminate", width=330)
+        progress.pack(pady=(0, 14))
+        progress.start()
+
+        def request_cancel():
+            cancel_event.set()
+            progress_label.configure(text="Cancelling at the next safe point…")
+            cancel_button.configure(state="disabled")
+
+        cancel_button = ctk.CTkButton(progress_dialog, text="Cancel",
+                                      width=100, command=request_cancel)
+        cancel_button.pack()
+        progress_dialog.protocol("WM_DELETE_WINDOW", request_cancel)
 
         def worker():
             try:
                 captured = ContinuityCameraService().capture(CaptureMode.SCAN)
-                if captured is None:
+                if captured is None or cancel_event.is_set():
                     self.root.after(
                         0, lambda: self._finish_function_scan(
-                            None, None, True, target_locomotive))
+                            None, None, True, target_locomotive,
+                            progress_dialog, progress))
                     return
-                ocr_result = OCRService().recognize(captured.path)
+                ocr_result = OCRService().recognize(
+                    captured.path, cancel_event=cancel_event)
+                if cancel_event.is_set():
+                    self.root.after(
+                        0, lambda: self._finish_function_scan(
+                            None, None, True, target_locomotive,
+                            progress_dialog, progress))
+                    return
                 available_icons = self.get_available_icons()
                 priors = historical_button_types(
                     self.z21_data.locomotives if self.z21_data else ())
@@ -742,17 +911,32 @@ class Z21GUIOperationsMixin:
                     ocr_result, available_icons, priors)
                 self.root.after(
                     0, lambda value=proposals: self._finish_function_scan(
-                        value, None, False, target_locomotive))
+                        value, None, cancel_event.is_set(), target_locomotive,
+                        progress_dialog, progress))
+            except OCRCancelledError as error:
+                logger.info("Function-table OCR cancelled")
+                self.root.after(
+                    0, lambda: self._finish_function_scan(
+                        None, None, True, target_locomotive,
+                        progress_dialog, progress))
             except Exception as error:
+                logger.exception("Function-table scan failed")
                 self.root.after(
                     0, lambda value=error: self._finish_function_scan(
-                        None, value, False, target_locomotive))
+                        None, value, cancel_event.is_set(), target_locomotive,
+                        progress_dialog, progress))
 
         threading.Thread(target=worker, name="iphone-function-table-scan",
                          daemon=True).start()
 
     def _finish_function_scan(self, proposals, error, cancelled,
-                              target_locomotive):
+                              target_locomotive, progress_dialog=None,
+                              progress=None):
+        if progress is not None:
+            progress.stop()
+        if progress_dialog is not None and progress_dialog.winfo_exists():
+            progress_dialog.grab_release()
+            progress_dialog.destroy()
         if hasattr(self, "function_scan_button"):
             self.function_scan_button.configure(
                 state="normal", text="Scan from iphone")
@@ -926,10 +1110,11 @@ class Z21GUIOperationsMixin:
                 data = json.load(f)
         except json.JSONDecodeError as e:
             messagebox.showerror("JSON Error", f"Invalid JSON file: {e}")
-            return
+            return False
         except Exception as e:
+            logger.exception("Unable to read JSON import file %s", file_path)
             messagebox.showerror("File Error", f"Failed to read JSON file: {e}")
-            return
+            return False
         
         # Handle different JSON structures
         loco_data = None
@@ -948,7 +1133,7 @@ class Z21GUIOperationsMixin:
         
         if not loco_data:
             messagebox.showwarning("Warning", "No locomotive data found in JSON file.")
-            return
+            return False
         
         # Helper function to get JSON value supporting both camelCase and snake_case field names
         def get_json_value(key_camel, key_snake=None):
@@ -1220,6 +1405,8 @@ class Z21GUIOperationsMixin:
                 self.set_status_message(f"Failed to update locomotive data from JSON: {e}")
         else:
             self.set_status_message("Failed to update locomotive: No locomotive selected")
+            return False
+        return True
     
 
     def show_ocr_result_dialog(self, extracted_text: str, file_path: str):
@@ -2000,11 +2187,22 @@ class Z21GUIOperationsMixin:
         """Save changes to locomotive details."""
         if not self.current_loco or not self.z21_data or not self.parser:
             messagebox.showerror("Error", "No locomotive selected or data not loaded.")
-            return
+            return False
 
         try:
+            form_values = {
+                "name": self.name_var.get(),
+                "address": self.address_var.get(),
+                "speed": self.speed_var.get(),
+                "build_year": self.build_year_var.get(),
+                "ip": self.ip_var.get(),
+                "in_stock_since": self.in_stock_since_var.get(),
+            }
+            validate_locomotive_form(form_values,
+                                     self.z21_data.locomotives,
+                                     self.current_loco)
             # Update attributes
-            self.current_loco.name = self.name_var.get()
+            self.current_loco.name = self.name_var.get().strip()
             self.current_loco.address = int(self.address_var.get())
             self.current_loco.speed = int(self.speed_var.get())
             self.current_loco.direction = self.direction_var.get() == "Forward"
@@ -2041,28 +2239,52 @@ class Z21GUIOperationsMixin:
                 self.z21_data.locomotives[self.current_loco_index] = self.current_loco
             else:
                 messagebox.showerror("Error", "Could not find locomotive in data structure.")
-                return
+                return False
 
             write_succeeded = False
             try:
-                self.parser.write(self.z21_data, self.z21_file)
+                self.parser.write(
+                    self.z21_data,
+                    self.z21_file,
+                    extra_members=self._pending_archive_members,
+                )
                 write_succeeded = True
             except Exception as write_error:
-                self.set_status_message(f"Failed to write changes to file: {write_error}. Changes saved in memory but not written to disk.")
+                logger.exception("Unable to persist locomotive changes")
+                self.set_status_message(
+                    f"Failed to write changes to file: {write_error}")
+                messagebox.showerror(
+                    "Save Error",
+                    f"Changes remain unsaved:\n{write_error}",
+                    parent=self.root,
+                )
 
             if write_succeeded:
+                self._pending_archive_members.clear()
+                self.capture_saved_state()
                 self.set_status_message(
                     "Locomotive details saved successfully to file!")
 
             self.populate_list(self.search_var.get() if hasattr(self, "search_var") else "", preserve_selection=True)
 
+            return write_succeeded
+
+        except LocomotiveValidationError as error:
+            messagebox.showerror("Check Locomotive Details", str(error),
+                                 parent=self.root)
+            self.set_status_message("Please correct the highlighted details")
+            return False
         except CategoryValidationError as e:
             messagebox.showerror("Invalid Category", str(e))
             self.set_status_message(str(e), timeout=12000)
+            return False
         except ValueError as e:
             self.set_status_message(f"Invalid input: {e}. Please enter valid numbers for Address and Max Speed.")
+            return False
         except Exception as e:
+            logger.exception("Unexpected error while saving locomotive")
             self.set_status_message(f"Failed to save changes: {e}")
+            return False
 
 
     def export_z21_loco(self):
@@ -2395,15 +2617,9 @@ class Z21GUIOperationsMixin:
 
 
     def share_with_airdrop(self):
-        """Share z21loco file via AirDrop using NSSharingService (macOS)."""
+        """Export and share through the configured desktop platform adapter."""
         if not self.current_loco or not self.z21_data or not self.parser:
             messagebox.showerror("Error", "No locomotive selected or data not loaded.")
-            return
-        if platform.system() != "Darwin":
-            messagebox.showerror("Error", "AirDrop sharing is only available on macOS.")
-            return
-        if not HAS_PYOBJC:
-            messagebox.showerror("Error", "PyObjC is required for AirDrop sharing.\nPlease install it with: pip install pyobjc-framework-Cocoa")
             return
 
         try:
@@ -2421,45 +2637,19 @@ class Z21GUIOperationsMixin:
                 messagebox.showerror("Error", f"Exported file not found at: {output_path}")
                 return
 
-            file_url = NSURL.fileURLWithPath_(str(output_path.absolute()))
-            file_array = NSArray.arrayWithObject_(file_url)
-            sharing_service = None
-
             try:
-                sharing_service = NSSharingService.sharingServiceNamed_("com.apple.share.AirDrop")
-            except Exception: 
-                pass
-
-            if not sharing_service:
-                try:
-                    available_services = NSSharingService.sharingServicesForItems_(file_array)
-                    for service in available_services:
-                        if "AirDrop" in service.title() or "airdrop" in service.title().lower():
-                            sharing_service = service
-                            break
-                except Exception: 
-                    pass
-
-            if sharing_service:
-                if sharing_service.canPerformWithItems_(file_array):
-                    sharing_service.performWithItems_(file_array)
-                    # Success: silently shared via AirDrop, no message box needed
-                else:
-                    # Fallback: show in Finder
-                    try:
-                        subprocess.run(["open", "-R", str(output_path)], check=True)
-                        # Success: Finder opened, no message box needed
-                    except subprocess.CalledProcessError:
-                        messagebox.showwarning("Warning", f"File exported to:\n{output_path}\n\nCould not open Finder.")
-            else:
-                # Fallback: show in Finder
-                try:
-                    subprocess.run(["open", "-R", str(output_path)], check=True)
-                    # Success: Finder opened (AirDrop not available but Finder works), no message box needed
-                except subprocess.CalledProcessError:
-                    messagebox.showwarning("Warning", f"File exported to:\n{output_path}\n\nAirDrop not available and could not open Finder.")
-
+                shared = self.platform_adapter.share_file(output_path)
+                if not shared:
+                    self.platform_adapter.reveal_file(output_path)
+                    messagebox.showinfo(
+                        "Ready to Share",
+                        f"AirDrop is unavailable. The exported file is selected in Finder:\n{output_path}")
+            except PlatformFeatureUnavailable as error:
+                messagebox.showwarning(
+                    "Sharing Unavailable",
+                    f"{error}\n\nThe exported file is available at:\n{output_path}")
         except Exception as e:
+            logger.exception("Unable to share exported locomotive")
             messagebox.showerror("Share Error", f"Failed to share locomotive: {e}")
 
 
@@ -2467,6 +2657,8 @@ class Z21GUIOperationsMixin:
         """Import locomotive from z21loco file."""
         if not self.z21_data or not self.parser:
             self.set_status_message("No Z21 data loaded.")
+            return
+        if self.current_loco is not None and not self.confirm_pending_changes():
             return
 
         import_file = filedialog.askopenfilename(
@@ -2519,23 +2711,52 @@ class Z21GUIOperationsMixin:
 
                     import_db.close()
                     imported_loco.is_new_import = True
-                    self.z21_data.locomotives.append(imported_loco)
+                    preview = (
+                        f"Name: {imported_loco.name or '—'}\n"
+                        f"Address: {imported_loco.address}\n"
+                        f"Max Speed: {imported_loco.speed}\n"
+                        f"Functions: {len(imported_loco.function_details)}")
+                    if not messagebox.askyesno(
+                            "Import Preview",
+                            f"Import this locomotive?\n\n{preview}",
+                            parent=self.root):
+                        self.set_status_message("Locomotive import cancelled")
+                        return
+
+                    validate_locomotive_form(
+                        {
+                            "name": imported_loco.name,
+                            "address": str(imported_loco.address),
+                            "speed": str(imported_loco.speed),
+                        }, self.z21_data.locomotives)
+                    pending_members = {}
 
                     if imported_loco.image_name:
                         for filename in import_zip.namelist():
                             if imported_loco.image_name in filename:
-                                with zipfile.ZipFile(self.z21_file, "a") as current_zip:
-                                    if imported_loco.image_name not in current_zip.namelist():
-                                        current_zip.writestr(imported_loco.image_name, import_zip.read(filename))
+                                pending_members[imported_loco.image_name] = (
+                                    import_zip.read(filename))
                                 break
 
-                    self.parser.write(self.z21_data, self.z21_file)
+                    self.z21_data.locomotives.append(imported_loco)
+                    try:
+                        self.parser.write(
+                            self.z21_data, self.z21_file,
+                            extra_members=pending_members)
+                    except Exception:
+                        self.z21_data.locomotives.remove(imported_loco)
+                        raise
                     self.populate_list(self.search_var.get() if hasattr(self, "search_var") else "", preserve_selection=True)
                     self.update_status_count()
                     self.set_status_message(f"Locomotive '{imported_loco.name}' imported successfully.")
                 finally:
                     Path(tmp_path).unlink()
+        except LocomotiveValidationError as error:
+            messagebox.showerror("Cannot Import Locomotive", str(error))
+            self.set_status_message("Import failed validation")
         except Exception as e:
+            logger.exception("Unable to import locomotive archive %s",
+                             import_path)
             messagebox.showerror("Import Error", f"Failed to import locomotive: {e}")
 
 
@@ -2574,8 +2795,9 @@ class Z21GUIOperationsMixin:
                     try:
                         # Clear the internal label's image reference safely
                         icon_preview_label._label.configure(image="")
-                    except:
-                        pass
+                    except Exception:
+                        logger.debug("Unable to clear icon preview image",
+                                     exc_info=True)
                     icon_preview_label.image = None
                 
                 if icon_name:
@@ -2596,8 +2818,9 @@ class Z21GUIOperationsMixin:
                 try:
                     icon_preview_label.configure(image=None, text="Preview error")
                     icon_preview_label.image = None
-                except:
-                    pass
+                except Exception:
+                    logger.debug("Unable to display icon preview error",
+                                 exc_info=True)
         icon_var.trace("w", update_icon_preview)
 
         form_frame = ctk.CTkFrame(main_frame)
@@ -2785,8 +3008,9 @@ class Z21GUIOperationsMixin:
         if self.edit_function_dialog is not None:
             try:
                 self.edit_function_dialog.destroy()
-            except:
-                pass
+            except Exception:
+                logger.debug("Unable to close prior function editor",
+                             exc_info=True)
             self.edit_function_dialog = None
 
         dialog = ctk.CTkToplevel(self.root)
@@ -2821,8 +3045,9 @@ class Z21GUIOperationsMixin:
                     try:
                         # Clear the internal label's image reference safely
                         icon_preview_label._label.configure(image="")
-                    except:
-                        pass
+                    except Exception:
+                        logger.debug("Unable to clear icon preview image",
+                                     exc_info=True)
                     icon_preview_label.image = None
                 
                 if icon_name:
@@ -2843,8 +3068,9 @@ class Z21GUIOperationsMixin:
                 try:
                     icon_preview_label.configure(image=None, text="Preview error")
                     icon_preview_label.image = None
-                except:
-                    pass
+                except Exception:
+                    logger.debug("Unable to display icon preview error",
+                                 exc_info=True)
         icon_var.trace("w", update_icon_preview)
         update_icon_preview()  # Initial preview
 

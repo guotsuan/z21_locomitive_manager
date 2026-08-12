@@ -6,6 +6,7 @@ import platform
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 from typing import List, Optional, Sequence, Tuple
 
 from .native_build import NativeBuildError, compile_swift
@@ -33,6 +34,10 @@ RAILWAY_CUSTOM_WORDS = (
 
 class OCRError(RuntimeError):
     """Raised when every available OCR engine fails."""
+
+
+class OCRCancelledError(OCRError):
+    """Raised when the caller cancels an OCR operation."""
 
 
 @dataclass(frozen=True)
@@ -113,7 +118,7 @@ class AppleVisionOCRService:
         self.languages = tuple(languages)
         self.custom_words = tuple(custom_words)
 
-    def recognize(self, input_path: Path) -> OCRResult:
+    def recognize(self, input_path: Path, cancel_event=None) -> OCRResult:
         input_path = Path(input_path)
         if not input_path.is_file():
             raise OCRError(f"OCR input file does not exist: {input_path}")
@@ -126,14 +131,32 @@ class AppleVisionOCRService:
                 "languages": self.languages,
                 "customWords": self.custom_words,
             }, ensure_ascii=False), encoding="utf-8")
-            process = subprocess.run([
+            command = [
                 str(helper), "--input", str(input_path),
                 "--config", str(config_path),
                 "--output", str(result_path),
-            ], capture_output=True, text=True, check=False)
+            ]
+            if cancel_event is None:
+                process = subprocess.run(command, capture_output=True,
+                                         text=True, check=False)
+                stderr_text = process.stderr
+            else:
+                process = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE, text=True)
+                while process.poll() is None:
+                    if cancel_event.is_set():
+                        process.terminate()
+                        try:
+                            process.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
+                        raise OCRCancelledError("OCR was cancelled.")
+                    time.sleep(0.05)
+                _stdout, stderr_text = process.communicate()
             if process.returncode != 0:
                 raise OCRError(
-                    process.stderr.strip() or
+                    stderr_text.strip() or
                     "Apple Vision OCR helper exited without a result.")
             try:
                 payload = json.loads(result_path.read_text(encoding="utf-8"))
@@ -206,7 +229,7 @@ class AppleVisionOCRService:
 class TesseractOCRService:
     """Compatibility fallback for systems where Apple Vision is unavailable."""
 
-    def recognize(self, input_path: Path) -> OCRResult:
+    def recognize(self, input_path: Path, cancel_event=None) -> OCRResult:
         try:
             import pytesseract
             from PIL import Image
@@ -220,18 +243,25 @@ class TesseractOCRService:
                 images = convert_from_path(str(input_path))
             else:
                 images = [Image.open(str(input_path))]
-            pages = tuple(OCRPage(
-                index=index,
-                width=float(image.width),
-                height=float(image.height),
-                observations=(TextObservation(
-                    text=pytesseract.image_to_string(image) or "",
-                    confidence=0.0,
-                    bounding_box=None,
-                    candidates=(),
-                ),),
-            ) for index, image in enumerate(images))
-            return OCRResult(engine="tesseract", languages=(), pages=pages)
+            pages = []
+            for index, image in enumerate(images):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise OCRCancelledError("OCR was cancelled.")
+                pages.append(OCRPage(
+                    index=index,
+                    width=float(image.width),
+                    height=float(image.height),
+                    observations=(TextObservation(
+                        text=pytesseract.image_to_string(image) or "",
+                        confidence=0.0,
+                        bounding_box=None,
+                        candidates=(),
+                    ),),
+                ))
+            return OCRResult(engine="tesseract", languages=(),
+                             pages=tuple(pages))
+        except OCRCancelledError:
+            raise
         except Exception as error:
             raise OCRError(f"Tesseract OCR failed: {error}") from error
 
@@ -245,15 +275,25 @@ class OCRService:
         self.fallback_service = fallback_service or TesseractOCRService()
         self.system_name = system_name or platform.system()
 
-    def recognize(self, input_path: Path) -> OCRResult:
+    def recognize(self, input_path: Path, cancel_event=None) -> OCRResult:
         vision_error = None
         if self.system_name == "Darwin":
             try:
-                return self.vision_service.recognize(input_path)
+                if cancel_event is None:
+                    return self.vision_service.recognize(input_path)
+                return self.vision_service.recognize(
+                    input_path, cancel_event=cancel_event)
+            except OCRCancelledError:
+                raise
             except OCRError as error:
                 vision_error = error
         try:
-            return self.fallback_service.recognize(input_path)
+            if cancel_event is None:
+                return self.fallback_service.recognize(input_path)
+            return self.fallback_service.recognize(
+                input_path, cancel_event=cancel_event)
+        except OCRCancelledError:
+            raise
         except OCRError as fallback_error:
             if vision_error:
                 raise OCRError(

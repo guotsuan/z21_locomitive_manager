@@ -6,6 +6,8 @@ GUI application to browse Z21 locomotives and their details.
 import sys
 import os
 import warnings
+import copy
+import logging
 
 # Suppress macOS-specific warnings that don't affect functionality
 if sys.platform == 'darwin':
@@ -30,20 +32,6 @@ import re
 import zipfile
 import platform
 
-# Try to import PyObjC for macOS sharing
-try:
-    from AppKit import (
-        NSApplication,
-        NSSharingService,
-        NSURL,
-        NSArray,
-        NSWorkspace,
-    )
-    from Foundation import NSFileManager
-    HAS_PYOBJC = True
-except ImportError:
-    HAS_PYOBJC = False
-
 try:
     from PIL import Image, ImageTk
     HAS_PIL = True
@@ -58,11 +46,28 @@ from src.parser import Z21Parser
 from src.data_models import Z21File, Locomotive, FunctionInfo
 from src.function_extraction import discover_icon_mapping
 from src.categories import DEFAULT_LOCOMOTIVE_CATEGORIES
+from src.platform_adapter import (
+    DesktopPlatformAdapter,
+    PlatformFeatureUnavailable,
+    get_platform_adapter,
+)
 from tools.z21lm_gui_operations import Z21GUIOperationsMixin
+
+
+logger = logging.getLogger(__name__)
 
 
 class Z21GUI(Z21GUIOperationsMixin):
     """Main GUI application for browsing Z21 locomotives."""
+
+    # Keep list rows readable in both CustomTkinter appearance modes.  Each
+    # tuple is (light mode, dark mode).
+    LOCO_ITEM_FG = ("gray90", "gray20")
+    LOCO_ITEM_HOVER = ("gray82", "gray27")
+    LOCO_ITEM_TEXT = ("gray15", "gray90")
+    LOCO_ITEM_SELECTED_FG = ("#1F6AA5", "#1F6AA5")
+    LOCO_ITEM_SELECTED_HOVER = ("#185987", "#287DB8")
+    LOCO_ITEM_SELECTED_TEXT = ("white", "white")
 
     def __init__(self, root, z21_file: Path):
         self.root = root
@@ -89,7 +94,18 @@ class Z21GUI(Z21GUIOperationsMixin):
         self.function_card_frames = {
         }  # Store card frames for selection highlighting
         self.edit_function_dialog = None  # Track edit function dialog window
+        self._saved_loco_snapshot = None
+        self._saved_form_snapshot = None
+        self._pending_archive_members = {}
+        self._force_dirty = False
+        self._pending_new_locomotive = None
+        try:
+            self.platform_adapter = get_platform_adapter()
+        except PlatformFeatureUnavailable as error:
+            logger.info("macOS integration is unavailable: %s", error)
+            self.platform_adapter = DesktopPlatformAdapter()
         self.setup_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close_requested)
         self.load_data()
         # Wait until Tk has created and laid out the native window before
         # activating it. This brings the app forward once at launch without
@@ -101,27 +117,101 @@ class Z21GUI(Z21GUIOperationsMixin):
         try:
             self.root.deiconify()
             self.root.update_idletasks()
-            if sys.platform == "darwin" and HAS_PYOBJC:
-                NSApplication.sharedApplication().activateIgnoringOtherApps_(
-                    True)
+            self.platform_adapter.activate_application()
             self.root.attributes("-topmost", True)
             self.root.lift()
             self.root.focus_force()
             self.root.after(250, self._release_startup_topmost)
         except Exception:
+            logger.debug("Unable to bring startup window forward",
+                         exc_info=True)
             # Window-manager support varies; lift/focus are the safe fallback.
             try:
                 self.root.lift()
                 self.root.focus_force()
             except Exception:
-                pass
+                logger.debug("Window lift fallback failed", exc_info=True)
 
     def _release_startup_topmost(self):
         """Return the window to normal stacking behavior after activation."""
         try:
             self.root.attributes("-topmost", False)
         except Exception:
-            pass
+            logger.debug("Unable to release temporary topmost state",
+                         exc_info=True)
+
+    def _form_snapshot(self):
+        """Return the editable values used for unsaved-change detection."""
+        if not hasattr(self, "name_var"):
+            return None
+        return (
+            self.name_var.get(), self.address_var.get(), self.speed_var.get(),
+            self.direction_var.get(), self.full_name_var.get(),
+            self.railway_var.get(), self.article_number_var.get(),
+            self.decoder_type_var.get(), self.build_year_var.get(),
+            self.model_buffer_length_var.get(), self.service_weight_var.get(),
+            self.model_weight_var.get(), self.rmin_var.get(), self.ip_var.get(),
+            self.drivers_cab_var.get(), self.active_var.get(),
+            self.crane_var.get(), self.speed_display_var.get(),
+            self.rail_vehicle_type_var.get(), self.regulation_step_var.get(),
+            self.categories_var.get(), self.in_stock_since_var.get(),
+            self.description_text.get("1.0", "end-1c"),
+        )
+
+    def capture_saved_state(self):
+        self._saved_loco_snapshot = copy.deepcopy(self.current_loco)
+        self._saved_form_snapshot = self._form_snapshot()
+        self._force_dirty = False
+        self._pending_new_locomotive = None
+
+    def has_unsaved_changes(self):
+        if self.current_loco is None or self._saved_loco_snapshot is None:
+            return False
+        return (self._force_dirty or
+                self.current_loco != self._saved_loco_snapshot or
+                self._form_snapshot() != self._saved_form_snapshot or
+                bool(self._pending_archive_members))
+
+    def _restore_saved_state(self):
+        if self._pending_new_locomotive is self.current_loco:
+            if self.z21_data is not None:
+                self.z21_data.locomotives = [
+                    locomotive for locomotive in self.z21_data.locomotives
+                    if locomotive is not self.current_loco
+                ]
+            self.current_loco = None
+            self.current_loco_index = None
+            self._pending_new_locomotive = None
+            self._force_dirty = False
+            return
+        if self._saved_loco_snapshot is None:
+            return
+        restored = copy.deepcopy(self._saved_loco_snapshot)
+        if self.z21_data is not None and self.current_loco_index is not None:
+            self.z21_data.locomotives[self.current_loco_index] = restored
+        self.current_loco = restored
+        self._pending_archive_members.clear()
+        self._force_dirty = False
+
+    def confirm_pending_changes(self):
+        """Offer Save, Discard, and Cancel before abandoning form edits."""
+        if not self.has_unsaved_changes():
+            return True
+        choice = messagebox.askyesnocancel(
+            "Unsaved Changes",
+            "This locomotive has unsaved changes. Save them before continuing?",
+            parent=self.root,
+        )
+        if choice is None:
+            return False
+        if choice:
+            return bool(self.save_locomotive_changes())
+        self._restore_saved_state()
+        return True
+
+    def on_close_requested(self):
+        if self.confirm_pending_changes():
+            self.root.destroy()
 
     def _set_mouse_over_function_icon(self, value: bool):
         """Set mouse over function icon flag and clear timeout ID."""
@@ -704,8 +794,8 @@ class Z21GUI(Z21GUIOperationsMixin):
             try:
                 if self.notebook.get() != "Overview":
                     return
-            except:
-                pass
+            except Exception:
+                logger.debug("Unable to read active overview tab", exc_info=True)
             scroll_amount = 0
             if event.num == 4: scroll_amount = -5
             elif event.num == 5: scroll_amount = 5
@@ -722,8 +812,8 @@ class Z21GUI(Z21GUIOperationsMixin):
                 try:
                     self.overview_text.yview_scroll(int(scroll_amount),
                                                     "units")
-                except:
-                    pass
+                except Exception:
+                    logger.debug("Overview text scrolling failed", exc_info=True)
             # Always return "break" to prevent event from bubbling to outer containers
             return "break"
 
@@ -738,15 +828,15 @@ class Z21GUI(Z21GUIOperationsMixin):
             try:
                 if self.notebook.get() != "Overview":
                     return
-            except:
-                pass
+            except Exception:
+                logger.debug("Unable to read active overview tab", exc_info=True)
             # Skip if mouse is over overview_text (let it handle its own scrolling)
             try:
                 if self.overview_text.winfo_containing(event.x_root,
                                                        event.y_root):
                     return  # Let overview_text handle it, don't scroll outer container
-            except:
-                pass
+            except Exception:
+                logger.debug("Unable to inspect pointer location", exc_info=True)
 
             # For outer containers, allow normal scrolling behavior
             # (This will scroll the scrollable_frame if needed)
@@ -825,7 +915,10 @@ class Z21GUI(Z21GUIOperationsMixin):
                     self.loco_listbox_frame,
                     text=display_text,
                     anchor="w",
-                    text_color="black",
+                    font=ctk.CTkFont(size=14),
+                    fg_color=self.LOCO_ITEM_FG,
+                    hover_color=self.LOCO_ITEM_HOVER,
+                    text_color=self.LOCO_ITEM_TEXT,
                     command=lambda idx=len(self.filtered_locos): self.
                     on_loco_button_click(idx),
                 )
@@ -896,7 +989,8 @@ class Z21GUI(Z21GUIOperationsMixin):
                     min(1.0, (button_bottom - canvas_height) / total_height))
                 canvas.yview_moveto(target_ratio)
         except Exception:
-            pass  # Ignore scroll errors
+            logger.debug("Unable to scroll selected locomotive into view",
+                         exc_info=True)
 
     def highlight_button(self, index: int):
         """Highlight a button at the given index."""
@@ -905,27 +999,41 @@ class Z21GUI(Z21GUIOperationsMixin):
         for i, button in enumerate(self.loco_listbox_buttons):
             if i == index:
                 button.configure(
-                    fg_color=("gray60", "gray40"))  # Darker color for selected
+                    fg_color=self.LOCO_ITEM_SELECTED_FG,
+                    hover_color=self.LOCO_ITEM_SELECTED_HOVER,
+                    text_color=self.LOCO_ITEM_SELECTED_TEXT,
+                )
             else:
                 button.configure(
-                    fg_color=("gray85",
-                              "gray18"))  # Lighter color for unselected
+                    fg_color=self.LOCO_ITEM_FG,
+                    hover_color=self.LOCO_ITEM_HOVER,
+                    text_color=self.LOCO_ITEM_TEXT,
+                )
         self.current_filtered_index = index
         # Scroll the button into view if it's outside visible area
         self.scroll_button_into_view(index)
 
     def on_loco_button_click(self, index: int):
-        self.highlight_button(index)
-        self.on_loco_select_by_index(index)
+        if self.on_loco_select_by_index(index):
+            self.highlight_button(index)
+        else:
+            self._highlight_current_locomotive()
         # Focus the list frame for keyboard navigation
         self.loco_listbox_frame.focus_set()
+
+    def _highlight_current_locomotive(self):
+        for index, locomotive in enumerate(self.filtered_locos):
+            if locomotive is self.current_loco:
+                self.highlight_button(index)
+                return
 
     def is_list_focused(self):
         """Check if the locomotive list has focus."""
         try:
             return self.loco_listbox_frame.focus_get(
             ) == self.loco_listbox_frame
-        except:
+        except Exception:
+            logger.debug("Unable to inspect locomotive-list focus", exc_info=True)
             return False
 
     def on_arrow_up(self, event):
@@ -933,12 +1041,11 @@ class Z21GUI(Z21GUIOperationsMixin):
         if not self.filtered_locos:
             return
         if self.current_filtered_index is None:
-            self.current_filtered_index = 0
+            target_index = 0
         else:
-            self.current_filtered_index = max(0,
-                                              self.current_filtered_index - 1)
-        self.highlight_button(self.current_filtered_index)
-        self.on_loco_select_by_index(self.current_filtered_index)
+            target_index = max(0, self.current_filtered_index - 1)
+        if self.on_loco_select_by_index(target_index):
+            self.highlight_button(target_index)
         return "break"
 
     def on_arrow_down(self, event):
@@ -946,19 +1053,21 @@ class Z21GUI(Z21GUIOperationsMixin):
         if not self.filtered_locos:
             return
         if self.current_filtered_index is None:
-            self.current_filtered_index = 0
+            target_index = 0
         else:
-            self.current_filtered_index = min(
+            target_index = min(
                 len(self.filtered_locos) - 1, self.current_filtered_index + 1)
-        self.highlight_button(self.current_filtered_index)
-        self.on_loco_select_by_index(self.current_filtered_index)
+        if self.on_loco_select_by_index(target_index):
+            self.highlight_button(target_index)
         return "break"
 
     def on_loco_select_by_index(self, index: int):
         """Handle locomotive selection by index."""
-        if index < len(self.filtered_locos):
+        if 0 <= index < len(self.filtered_locos):
             new_loco = self.filtered_locos[index]
             if self.current_loco is None or new_loco.address != self.current_loco.address or new_loco.name != self.current_loco.name:
+                if self.current_loco is not None and not self.confirm_pending_changes():
+                    return False
                 self.current_loco = new_loco
                 self.original_loco_address = self.current_loco.address
                 self.user_selected_loco = self.current_loco
@@ -969,10 +1078,14 @@ class Z21GUI(Z21GUIOperationsMixin):
                             self.current_loco_index = i
                             break
                 self.update_details()
+                self.capture_saved_state()
+            return True
+        return False
 
     def on_search(self, *args):
         filter_text = self.search_var.get()
-        self.populate_list(filter_text, auto_select_first=True)
+        self.populate_list(filter_text, preserve_selection=True,
+                           auto_select_first=True)
 
     def on_loco_select(self, event):
         pass
@@ -1058,9 +1171,11 @@ class Z21GUI(Z21GUIOperationsMixin):
                 try:
                     label._label.configure(image="")
                 except Exception:
-                    pass
+                    logger.debug("Unable to clear native label image",
+                                 exc_info=True)
             except Exception:
-                pass
+                logger.debug("Unable to clear locomotive image",
+                             exc_info=True)
 
         def safe_configure_label(label, **kwargs):
             """Safely configure label, ignoring any image-related errors."""
@@ -1079,7 +1194,8 @@ class Z21GUI(Z21GUIOperationsMixin):
                         if hasattr(label, '_draw'):
                             label._draw()
                     except Exception:
-                        pass
+                        logger.debug("Unable to draw fallback image label",
+                                     exc_info=True)
 
         # Clear previous image reference and internal label image
         safe_clear_image(self.loco_image_label)
@@ -1101,20 +1217,23 @@ class Z21GUI(Z21GUIOperationsMixin):
                         safe_configure_label(self.loco_image_label,
                                              text=f"Image:\n{loco.image_name}")
                     except Exception:
-                        pass
+                        logger.debug("Unable to show image filename fallback",
+                                     exc_info=True)
             else:
                 try:
                     self.loco_image_label.image = None
                     safe_configure_label(self.loco_image_label,
                                          text=f"Image:\n{loco.image_name}")
                 except Exception:
-                    pass
+                    logger.debug("Unable to show missing locomotive image",
+                                 exc_info=True)
         else:
             try:
                 self.loco_image_label.image = None
                 safe_configure_label(self.loco_image_label, text="No Image")
             except Exception:
-                pass
+                logger.debug("Unable to clear locomotive image label",
+                             exc_info=True)
 
         self.overview_text.configure(state="normal")
         self.overview_text.delete(1.0, "end")
@@ -1195,8 +1314,8 @@ Function Details:  {len(loco.function_details)} available
                     canvas_width = canvas.winfo_width()
                     if canvas_width > 100:
                         current_canvas_width = canvas_width
-                except:
-                    pass
+                except Exception:
+                    logger.debug("Unable to measure function canvas", exc_info=True)
             if current_canvas_width <= 100:
                 root_width = self.root.winfo_width()
                 if root_width > 100:
@@ -1221,8 +1340,8 @@ Function Details:  {len(loco.function_details)} available
                     canvas_width = canvas.winfo_width()
                     if canvas_width > 100:
                         current_canvas_width = canvas_width
-                except:
-                    pass
+                except Exception:
+                    logger.debug("Unable to measure function canvas", exc_info=True)
             if current_canvas_width <= 100:
                 root_width = self.root.winfo_width()
                 if root_width > 100:
@@ -1353,8 +1472,9 @@ Function Details:  {len(loco.function_details)} available
             for i in range(cols, max_configured_cols):
                 try:
                     self.functions_frame_inner.grid_columnconfigure(i, weight=0)
-                except:
-                    pass
+                except Exception:
+                    logger.debug("Unable to reset unused function column",
+                                 exc_info=True)
         self._max_configured_cols = cols
 
         # Sort by position, then by function number (same as list_locomotives.py)
@@ -1403,8 +1523,9 @@ Function Details:  {len(loco.function_details)} available
                     def change_cursor():
                         try:
                             widget.configure(cursor="hand2")
-                        except:
-                            pass
+                        except Exception:
+                            logger.debug("Unable to set function cursor",
+                                         exc_info=True)
                         self._cursor_change_timeout_id = None
                     # Delay cursor change to avoid flicker during rapid mouse movement
                     # Use after_idle to update when GUI is idle, reducing render impact
@@ -1422,8 +1543,9 @@ Function Details:  {len(loco.function_details)} available
                     def reset_cursor():
                         try:
                             widget.configure(cursor="")
-                        except:
-                            pass
+                        except Exception:
+                            logger.debug("Unable to reset function cursor",
+                                         exc_info=True)
                     self.root.after_idle(reset_cursor)
                     # Schedule mouse leave flag update with delay
                     self._mouse_leave_timeout_id = self.root.after(
@@ -1591,20 +1713,12 @@ Function Details:  {len(loco.function_details)} available
                 is_resize=True)  # Mark as resize call to add extra column
 
     def save_function_changes(self):
-        """Save all function changes to the Z21 file."""
+        """Persist function and overview edits in one archive rebuild."""
         if not self.current_loco or not self.z21_data or not self.parser:
             self.set_status_message(
                 "No locomotive selected or data not loaded.")
             return
-        try:
-            if self.current_loco_index is not None:
-                self.z21_data.locomotives[
-                    self.current_loco_index] = self.current_loco
-            self.parser.write(self.z21_data, self.z21_file)
-            self.set_status_message(
-                "All function changes saved successfully to file!")
-        except Exception as write_error:
-            self.set_status_message(f"Failed to write changes: {write_error}")
+        self.save_locomotive_changes()
 
     def get_next_unused_function_number(self):
         """Get the next unused function number for the current locomotive."""
@@ -1711,7 +1825,8 @@ Function Details:  {len(loco.function_details)} available
                                 if icon_resized.mode == "RGBA" else None)
                             return ctk.CTkImage(light_image=white_bg, size=size)
                         except Exception:
-                            pass  # Fall through to pattern matching
+                            logger.debug("Mapped function icon could not be loaded",
+                                         exc_info=True)
             
             # Fallback: try pattern matching if not in mapping or mapping failed
             icon_patterns = [
@@ -1749,6 +1864,17 @@ Function Details:  {len(loco.function_details)} available
         """Load locomotive image from Z21 ZIP file."""
         if not image_name or not HAS_PIL: return None
         try:
+            pending_data = self._pending_archive_members.get(image_name)
+            if pending_data is not None:
+                from io import BytesIO
+                img = Image.open(BytesIO(pending_data))
+                img.thumbnail(size, Image.LANCZOS)
+                bg_img = Image.new("RGB", size, color="white")
+                x_off = (size[0] - img.size[0]) // 2
+                y_off = (size[1] - img.size[1]) // 2
+                bg_img.paste(img, (x_off, y_off),
+                             img if img.mode == "RGBA" else None)
+                return ctk.CTkImage(light_image=bg_img, size=bg_img.size)
             with zipfile.ZipFile(self.z21_file, "r") as zf:
                 image_path = next(
                     (f for f in zf.namelist() if f.endswith(image_name)), None)
@@ -1762,8 +1888,9 @@ Function Details:  {len(loco.function_details)} available
                     bg_img.paste(img, (x_off, y_off),
                                  img if img.mode == "RGBA" else None)
                     return ctk.CTkImage(light_image=bg_img, size=bg_img.size)
-        except Exception as e:
-            print(f"Error loading locomotive image '{image_name}': {e}")
+        except (OSError, zipfile.BadZipFile) as error:
+            logger.warning("Unable to load locomotive image %s: %s",
+                           image_name, error)
             return None
 
     def create_function_card(self, func_num: int, func_info):
@@ -1859,6 +1986,20 @@ def main():
                         default=Path("z21_new.z21"),
                         help="Z21 file to open (default: z21_new.z21)")
     args = parser.parse_args()
+
+    log_directory = Path.home() / "Library" / "Logs" / "Z21 Locomotive Manager"
+    try:
+        log_directory.mkdir(parents=True, exist_ok=True)
+        logging.basicConfig(
+            filename=log_directory / "application.log",
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
+    except OSError:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
 
     if not args.file.exists():
         print(f"Error: File not found: {args.file}")

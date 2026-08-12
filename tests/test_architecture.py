@@ -1,5 +1,7 @@
 import unittest
 from pathlib import Path
+import tempfile
+import zipfile
 
 from src.archive import Z21Archive
 from src.parser import Z21Parser
@@ -37,6 +39,16 @@ class ArchitectureBoundaryTests(unittest.TestCase):
 
         self.assertEqual(len(parsed.locomotives), 1)
         self.assertEqual(parsed.locomotives[0].name, "DE 18 VOSSLOH")
+
+    def test_parser_batches_new_archive_members_with_database_save(self):
+        parser = Z21Parser(FIXTURE_PATH)
+        parsed = parser.parse()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "saved.z21loco"
+            parser.write(parsed, output,
+                         extra_members={"NEW_IMAGE.png": b"image bytes"})
+            with zipfile.ZipFile(output) as archive:
+                self.assertEqual(archive.read("NEW_IMAGE.png"), b"image bytes")
 
 
 if __name__ == "__main__":

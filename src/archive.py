@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import sqlite3
 import tempfile
-from typing import Optional
+from typing import Mapping, Optional
 import zipfile
 
 
@@ -38,7 +38,8 @@ class Z21Archive:
             return archive.read(member_path)
 
     def replace_sqlite(self, sqlite_path: str, sqlite_data: bytes,
-                       output_path: Path, expected_locomotives: int) -> Path:
+                       output_path: Path, expected_locomotives: int,
+                       extra_members: Optional[Mapping[str, bytes]] = None) -> Path:
         """Build, validate, and atomically install an updated archive."""
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -49,7 +50,8 @@ class Z21Archive:
             candidate_path = Path(candidate_file.name)
 
         try:
-            self._build_candidate(sqlite_path, sqlite_data, candidate_path)
+            self._build_candidate(sqlite_path, sqlite_data, candidate_path,
+                                  extra_members or {})
             self._validate_candidate(candidate_path, expected_locomotives)
             os.replace(candidate_path, output_path)
             return output_path
@@ -57,13 +59,16 @@ class Z21Archive:
             candidate_path.unlink(missing_ok=True)
 
     def _build_candidate(self, sqlite_path: str, sqlite_data: bytes,
-                         candidate_path: Path) -> None:
+                         candidate_path: Path,
+                         extra_members: Mapping[str, bytes]) -> None:
         with zipfile.ZipFile(self.path, "r") as source_archive:
             with zipfile.ZipFile(candidate_path, "w",
                                  zipfile.ZIP_DEFLATED) as output_archive:
                 for item in source_archive.infolist():
                     data = (sqlite_data if item.filename == sqlite_path else
-                            source_archive.read(item.filename))
+                            extra_members.get(
+                                item.filename,
+                                source_archive.read(item.filename)))
                     copied_info = zipfile.ZipInfo(filename=item.filename,
                                                    date_time=item.date_time)
                     copied_info.compress_type = (
@@ -73,6 +78,10 @@ class Z21Archive:
                     copied_info.comment = item.comment
                     copied_info.extra = item.extra
                     output_archive.writestr(copied_info, data)
+                existing = set(source_archive.namelist())
+                for member_name, data in extra_members.items():
+                    if member_name not in existing:
+                        output_archive.writestr(member_name, data)
 
     def _validate_candidate(self, archive_path: Path,
                             expected_locomotives: int) -> None:

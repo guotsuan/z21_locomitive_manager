@@ -1,4 +1,5 @@
 import json
+import threading
 import subprocess
 import tempfile
 import unittest
@@ -115,6 +116,18 @@ class OCRServiceSelectionTests(unittest.TestCase):
         service = OCRService(vision, fallback, system_name="Darwin")
 
         self.assertIs(service.recognize(Path("manual.png")), fallback_result)
+
+    def test_cancellation_token_is_forwarded_to_engine(self):
+        result = OCRResult("apple-vision", (), ())
+        vision = mock.Mock()
+        vision.recognize.return_value = result
+        cancel_event = threading.Event()
+        service = OCRService(vision, mock.Mock(), system_name="Darwin")
+
+        self.assertIs(service.recognize(Path("manual.pdf"),
+                                        cancel_event=cancel_event), result)
+        vision.recognize.assert_called_once_with(
+            Path("manual.pdf"), cancel_event=cancel_event)
 
 
 if __name__ == "__main__":

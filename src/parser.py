@@ -1,7 +1,7 @@
 """Public parser facade for Z21 locomotive archives."""
 
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 import xml.etree.ElementTree as ET
 import zipfile
 
@@ -39,7 +39,8 @@ class Z21Parser:
             ])
 
     def write(self, z21_file: Z21File,
-              output_path: Optional[Path] = None) -> Path:
+              output_path: Optional[Path] = None,
+              extra_members: Optional[Mapping[str, bytes]] = None) -> Path:
         """Persist a Z21 model using its format-specific repository."""
         output_path = Path(output_path) if output_path else self.file_path
         archive_format = self.archive.inspect()
@@ -56,6 +57,7 @@ class Z21Parser:
             updated_database,
             output_path,
             expected_locomotives,
+            extra_members,
         )
 
     def _parse_xml(self, xml_content: str) -> Z21File:
