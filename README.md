@@ -1,5 +1,7 @@
 # Z21 Locomotive Manager
 
+> 原生 macOS SwiftUI 重写位于 [`macos-swift/`](macos-swift/README.md)。它覆盖机车与功能管理、Z21/Z21Loco 导入导出、Continuity Camera、Vision OCR、DeepSeek 审核和 Keychain，并可构建为独立 `.app`。
+
 ## Purpose 
 For Roco products, it is easy to add your model train to your trains/locomotives library in the Z21 App by simply loading the details and function configuration from the online database. However, for model trains/locomotives from other manufacturers, the process is less efficient. You must manually enter all details and function mappings one by one in the Z21 App.
  
