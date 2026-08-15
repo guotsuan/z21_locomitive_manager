@@ -18,7 +18,11 @@ final class Z21ArchiveDocument {
             guard let relative = databases.sorted(by: { $0.count < $1.count }).first else {
                 throw Z21Error.invalidArchive("The archive contains no SQLite database.")
             }
-            databaseURL = root.appendingPathComponent(relative)
+            let candidate = root.appendingPathComponent(relative)
+            guard let safeDatabase = Self.containedRegularFile(candidate, in: root) else {
+                throw Z21Error.invalidArchive("The archive database path is not safe.")
+            }
+            databaseURL = safeDatabase
         } catch {
             try? FileManager.default.removeItem(at: root)
             throw error
@@ -53,12 +57,30 @@ final class Z21ArchiveDocument {
     }
 
     func imageURL(named name: String) -> URL? {
+        Self.imageURL(in: workingDirectory, named: name)
+    }
+
+    static func imageURL(in workingDirectory: URL, named name: String) -> URL? {
         guard !name.isEmpty else { return nil }
         let direct = workingDirectory.appendingPathComponent(name)
-        if FileManager.default.fileExists(atPath: direct.path) { return direct }
+        if let safeDirect = Self.containedRegularFile(direct, in: workingDirectory) { return safeDirect }
+        let requestedName = URL(fileURLWithPath: name).lastPathComponent
         let match = try? FileManager.default.subpathsOfDirectory(atPath: workingDirectory.path)
-            .first(where: { URL(fileURLWithPath: $0).lastPathComponent == URL(fileURLWithPath: name).lastPathComponent })
-        return match.map { workingDirectory.appendingPathComponent($0) }
+            .first(where: { URL(fileURLWithPath: $0).lastPathComponent == requestedName })
+        guard let match else { return nil }
+        return Self.containedRegularFile(workingDirectory.appendingPathComponent(match), in: workingDirectory)
+    }
+
+    private static func containedRegularFile(_ candidate: URL, in root: URL) -> URL? {
+        let safeRoot = root.standardizedFileURL.resolvingSymlinksInPath()
+        let standardizedCandidate = candidate.standardizedFileURL
+        let resolvedCandidate = standardizedCandidate.resolvingSymlinksInPath()
+        let rootPrefix = safeRoot.path.hasSuffix("/") ? safeRoot.path : safeRoot.path + "/"
+        guard resolvedCandidate.path.hasPrefix(rootPrefix) else { return nil }
+        guard let values = try? standardizedCandidate.resourceValues(
+            forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        ), values.isRegularFile == true, values.isSymbolicLink != true else { return nil }
+        return standardizedCandidate
     }
 
     static func run(_ executable: String, _ arguments: [String], currentDirectory: URL? = nil) throws {

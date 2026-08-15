@@ -19,6 +19,7 @@ enum ImportReviewStage: String {
 struct ImportReviewSession: Identifiable {
     let id = UUID()
     let source: String
+    let targetID: UUID
     let target: String
     var stage: ImportReviewStage
 }

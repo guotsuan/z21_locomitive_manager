@@ -46,11 +46,12 @@ enum ImportExportService {
         return locomotive
     }
 
-    static func exportLocomotive(_ locomotive: Locomotive, from source: URL, to destination: URL) throws {
+    static func exportLocomotive(_ locomotive: Locomotive, from sourceDocument: Z21ArchiveDocument,
+                                 to destination: URL) throws {
         let tempArchive = FileManager.default.temporaryDirectory
             .appendingPathComponent("Z21-export-\(UUID().uuidString).z21loco")
-        try FileManager.default.copyItem(at: source, to: tempArchive)
         defer { try? FileManager.default.removeItem(at: tempArchive) }
+        try sourceDocument.write(to: tempArchive)
         let document = try Z21ArchiveDocument(url: tempArchive)
         var clone = locomotive
         clone.id = UUID()
@@ -68,17 +69,9 @@ enum ImportExportService {
         return directory.appendingPathComponent(filename)
     }
 
+    @MainActor
     static func shareViaAirDrop(_ url: URL) throws {
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            throw Z21Error.service("The AirDrop export file could not be created.")
-        }
-        guard let service = NSSharingService(named: .sendViaAirDrop) else {
-            throw Z21Error.service("AirDrop is not available on this Mac.")
-        }
-        guard service.canPerform(withItems: [url]) else {
-            throw Z21Error.service("AirDrop cannot share this .z21loco file.")
-        }
-        service.perform(withItems: [url])
+        try AirDropShareManager.share(url)
     }
 }
 

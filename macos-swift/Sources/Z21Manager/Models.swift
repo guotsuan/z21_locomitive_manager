@@ -1,7 +1,7 @@
 import Foundation
 import Darwin
 
-struct FunctionInfo: Identifiable, Codable, Hashable {
+struct FunctionInfo: Identifiable, Codable, Hashable, Sendable {
     var id: Int { number }
     var number: Int = 0
     var imageName: String = "neutral"
@@ -16,7 +16,7 @@ struct FunctionInfo: Identifiable, Codable, Hashable {
     }
 }
 
-struct Locomotive: Identifiable, Codable, Hashable {
+struct Locomotive: Identifiable, Codable, Hashable, Sendable {
     var id = UUID()
     var vehicleID: Int64?
     var isNewImport = false

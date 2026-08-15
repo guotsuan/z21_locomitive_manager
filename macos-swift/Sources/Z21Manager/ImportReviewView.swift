@@ -149,7 +149,7 @@ struct ImportReviewView: View {
     }
 
     private func selectNewFunctions(_ numbers: [Int]) {
-        let existing = Set(state.selected?.functions.map(\.number) ?? [])
+        let existing = Set(state.importTarget?.functions.map(\.number) ?? [])
         selectedFunctions = Set(numbers).subtracting(existing)
     }
 
@@ -164,7 +164,7 @@ struct ImportReviewView: View {
     }
 
     private func changeLabel(_ number: Int) -> some View {
-        Text(state.selected?.functions.contains(where: { $0.number == number }) == true ? "Update" : "Add")
+        Text(state.importTarget?.functions.contains(where: { $0.number == number }) == true ? "Update" : "Add")
             .font(.caption).foregroundStyle(.secondary)
     }
 

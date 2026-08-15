@@ -22,6 +22,7 @@ struct ContentView: View {
             StatusPresenter()
         }
         .frame(minWidth: 980, minHeight: 660)
+        .background(WindowCloseGuard(state: state).frame(width: 0, height: 0))
         .toolbar { toolbar }
         .alert("Z21 Manager", isPresented: Binding(
             get: { state.errorMessage != nil },

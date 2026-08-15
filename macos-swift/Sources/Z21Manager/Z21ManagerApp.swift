@@ -3,11 +3,13 @@ import SwiftUI
 
 @main
 struct Z21ManagerApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var state = AppState()
 
     var body: some Scene {
         WindowGroup {
             ContentView().environmentObject(state)
+                .onAppear { appDelegate.state = state }
                 .onOpenURL { state.open($0) }
         }
         .defaultSize(width: 1180, height: 780)
@@ -54,5 +56,22 @@ struct Z21ManagerApp: App {
             }
         }
         Settings { SettingsView() }
+    }
+}
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    weak var state: AppState?
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let state, state.isDirty else { return .terminateNow }
+        state.requestAbandonChanges(markDiscarded: true) { proceed in
+            sender.reply(toApplicationShouldTerminate: proceed)
+        }
+        return .terminateLater
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
     }
 }

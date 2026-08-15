@@ -24,7 +24,7 @@ final class Z21Repository {
         ].filter(columns.contains)
         let order = columns.contains("position") ? "position" : "id"
         let rows = try database.rows(
-            "SELECT \(wanted.map(quoteIdentifier).joined(separator: ", ")) FROM vehicles WHERE type = 0 ORDER BY \(quoteIdentifier(order))"
+            "SELECT \(wanted.map(quoteIdentifier).joined(separator: ", ")) FROM vehicles WHERE type IN (0, 1, 2) ORDER BY \(quoteIdentifier(order))"
         )
         return try rows.map { row in
             var locomotive = Locomotive()
@@ -81,9 +81,8 @@ final class Z21Repository {
                 try syncCategories(locomotives[index].categories, vehicleID: id)
                 try syncTraction(locomotives[index].regulationStep, vehicleID: id)
             }
-            let existing = try database.rows("SELECT id FROM vehicles WHERE type = 0").compactMap { $0["id"]?.int }
+            let existing = try database.rows("SELECT id FROM vehicles WHERE type IN (0, 1, 2)").compactMap { $0["id"]?.int }
             for id in existing where !kept.contains(id) { try deleteLocomotive(id: id) }
-            try database.execute("PRAGMA user_version = 16")
         }
     }
 
@@ -150,7 +149,10 @@ final class Z21Repository {
     }
 
     private func insertVehicle(_ locomotive: Locomotive, columns: Set<String>) throws -> Int64 {
-        let maxPosition = try database.scalarInt("SELECT MAX(position) FROM vehicles WHERE type = 0") ?? 0
+        let maxPosition = try database.scalarInt(
+            "SELECT MAX(position) FROM vehicles WHERE type = ?",
+            [.integer(Int64(locomotive.railVehicleType))]
+        ) ?? 0
         let values = vehicleValues(locomotive, columns: columns, position: Int(maxPosition + 1)).sorted { $0.key < $1.key }
         try database.execute(
             "INSERT INTO vehicles (\(values.map { quoteIdentifier($0.key) }.joined(separator: ", "))) VALUES (\(values.map { _ in "?" }.joined(separator: ", ")))",
@@ -166,20 +168,24 @@ final class Z21Repository {
             try database.execute("DELETE FROM functions WHERE vehicle_id = ? AND function = ?", [.integer(vehicleID), .integer(Int64(number))])
         }
         for (position, function) in functions.sorted(by: { ($0.position, $0.number) < ($1.position, $1.number) }).enumerated() {
-            let values: [SQLiteValue] = [
+            let commonValues: [SQLiteValue] = [
                 .integer(Int64(position)), .text(function.shortcut), function.time.map(SQLiteValue.double) ?? .null,
-                .text(function.imageName), .integer(Int64(function.buttonType)), .integer(vehicleID), .integer(Int64(function.number))
+                .text(function.imageName), .integer(Int64(function.buttonType))
             ]
             if existing.contains(function.number) {
                 try database.execute("""
-                    UPDATE functions SET position=?, shortcut=?, time=?, image_name=?, button_type=?, is_configured=1, show_function_number=1
+                    UPDATE functions SET position=?, shortcut=?, time=?, image_name=?, button_type=?, is_configured=?, show_function_number=1
                     WHERE vehicle_id=? AND function=?
-                    """, values)
+                    """, commonValues + [
+                        .integer(function.isActive ? 1 : 0), .integer(vehicleID), .integer(Int64(function.number))
+                    ])
             } else {
                 try database.execute("""
                     INSERT INTO functions (position, shortcut, time, image_name, button_type, vehicle_id, function, is_configured, show_function_number)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1)
-                    """, values)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+                    """, commonValues + [
+                        .integer(vehicleID), .integer(Int64(function.number)), .integer(function.isActive ? 1 : 0)
+                    ])
             }
         }
     }

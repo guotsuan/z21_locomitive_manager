@@ -9,6 +9,7 @@ struct FunctionWorkspace: View {
     @State private var mode: DisplayMode = .grid
     @State private var selection = Set<Int>()
     @State private var searchText = ""
+    @FocusState private var focusedNumber: Int?
 
     private enum DisplayMode: String, CaseIterable, Identifiable {
         case grid = "Grid"
@@ -46,8 +47,19 @@ struct FunctionWorkspace: View {
             }
         }
         .onDeleteCommand(perform: deleteSelection)
+        .onMoveCommand(perform: moveSelection)
+        .onExitCommand {
+            focusedNumber = nil
+            selection.removeAll()
+        }
         .onChange(of: functions.map(\.number)) {
             selection = selection.intersection(Set(functions.map(\.number)))
+            if let focusedNumber, !functions.contains(where: { $0.number == focusedNumber }) {
+                self.focusedNumber = nil
+            }
+        }
+        .onChange(of: focusedNumber) {
+            if let focusedNumber { selection = [focusedNumber] }
         }
     }
 
@@ -126,16 +138,16 @@ struct FunctionWorkspace: View {
         ScrollView {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 150, maximum: 210), spacing: 12)], alignment: .leading, spacing: 12) {
                 ForEach(displayedFunctions) { function in
-                    FunctionWorkspaceCard(function: function, isSelected: selection.contains(function.number))
-                        .contentShape(Rectangle())
-                        .onTapGesture { select(function.number) }
-                        .onTapGesture(count: 2) { selection = [function.number] }
-                        .accessibilityAction { select(function.number) }
+                    Button { select(function.number) } label: {
+                        FunctionWorkspaceCard(function: function, isSelected: selection.contains(function.number))
+                    }
+                        .buttonStyle(.plain)
+                        .focused($focusedNumber, equals: function.number)
                         .accessibilityAction(named: function.isActive ? "Deactivate Function" : "Activate Function") {
                             toggleActive(function.number)
                         }
                         .contextMenu {
-                            Button("Edit") { selection = [function.number] }
+                            Button("Edit") { select(function.number) }
                             Button("Duplicate") { duplicate(function) }
                             Divider()
                             Button("Delete", role: .destructive) { delete(function.number) }
@@ -159,6 +171,16 @@ struct FunctionWorkspace: View {
                             onSelect: { select(function.number) },
                             onToggleActive: { toggleActive(function.number) }
                         )
+                        .focusable()
+                        .focused($focusedNumber, equals: function.number)
+                        .onKeyPress(.return) {
+                            select(function.number)
+                            return .handled
+                        }
+                        .onKeyPress(.space) {
+                            select(function.number)
+                            return .handled
+                        }
                         .contextMenu {
                             Button("Duplicate") { duplicate(function) }
                             Button("Delete", role: .destructive) { delete(function.number) }
@@ -226,6 +248,7 @@ struct FunctionWorkspace: View {
     }
 
     private func select(_ number: Int) {
+        focusedNumber = number
         if NSEvent.modifierFlags.contains(.command) {
             if selection.contains(number) {
                 selection.remove(number)
@@ -234,6 +257,23 @@ struct FunctionWorkspace: View {
             }
         } else {
             selection = [number]
+        }
+    }
+
+    private func moveSelection(_ direction: MoveCommandDirection) {
+        let numbers = displayedFunctions.map(\.number)
+        let delta: Int
+        switch direction {
+        case .left, .up: delta = -1
+        case .right, .down: delta = 1
+        default: return
+        }
+        if let destination = FunctionKeyboardNavigation.adjacentNumber(
+            in: numbers,
+            current: focusedNumber ?? selectedNumber,
+            offset: delta
+        ) {
+            select(destination)
         }
     }
 
@@ -249,6 +289,14 @@ struct FunctionWorkspace: View {
                 if let index = functions.firstIndex(where: { $0.number == number }) { functions[index].isActive = value }
             }
         )
+    }
+}
+
+enum FunctionKeyboardNavigation {
+    static func adjacentNumber(in numbers: [Int], current: Int?, offset: Int) -> Int? {
+        guard !numbers.isEmpty else { return nil }
+        guard let current, let index = numbers.firstIndex(of: current) else { return numbers[0] }
+        return numbers[min(numbers.count - 1, max(0, index + offset))]
     }
 }
 
@@ -313,19 +361,28 @@ private struct FunctionTableRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Text("F\(function.number)")
-                .fontWeight(.semibold)
-                .frame(width: 45, alignment: .leading)
-            FunctionIcon(function: function)
-                .frame(width: 50, height: 28)
-            Text(function.shortcut.isEmpty ? function.imageName : function.shortcut)
-                .lineLimit(1)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            Text(function.buttonTypeName)
-                .frame(width: 110, alignment: .leading)
-            Text(function.buttonType == 2 ? "\(function.time ?? 0, specifier: "%.1f") s" : "—")
-                .foregroundStyle(function.buttonType == 2 ? .primary : .secondary)
-                .frame(width: 70, alignment: .leading)
+            Button(action: onSelect) {
+                HStack(spacing: 8) {
+                    Text("F\(function.number)")
+                        .fontWeight(.semibold)
+                        .frame(width: 45, alignment: .leading)
+                    FunctionIcon(function: function)
+                        .frame(width: 50, height: 28)
+                    Text(function.shortcut.isEmpty ? function.imageName : function.shortcut)
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Text(function.buttonTypeName)
+                        .frame(width: 110, alignment: .leading)
+                    Text(function.buttonType == 2 ? "\(function.time ?? 0, specifier: "%.1f") s" : "—")
+                        .foregroundStyle(function.buttonType == 2 ? .primary : .secondary)
+                        .frame(width: 70, alignment: .leading)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(FunctionAccessibility.summary(for: function, isSelected: isSelected))
+            .accessibilityHint("Activate to select this function")
+            .accessibilityAddTraits(isSelected ? .isSelected : [])
             Toggle("F\(function.number) Active", isOn: $isActive)
                 .labelsHidden()
                 .frame(width: 55)
@@ -333,14 +390,7 @@ private struct FunctionTableRow: View {
         .padding(.horizontal, 10)
         .frame(minHeight: 42)
         .background(isSelected ? Color.accentColor.opacity(0.16) : Color.clear)
-        .contentShape(Rectangle())
-        .onTapGesture(perform: onSelect)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(FunctionAccessibility.summary(for: function, isSelected: isSelected))
-        .accessibilityHint("Activate to select this function")
-        .accessibilityAddTraits(.isButton)
-        .accessibilityAddTraits(isSelected ? .isSelected : [])
-        .accessibilityAction { onSelect() }
+        .accessibilityElement(children: .contain)
         .accessibilityAction(named: function.isActive ? "Deactivate Function" : "Activate Function", onToggleActive)
         .overlay(alignment: .bottom) { Divider() }
     }

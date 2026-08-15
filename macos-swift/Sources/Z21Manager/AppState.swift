@@ -21,32 +21,47 @@ final class AppState: ObservableObject {
     @Published var cropSourceURL: URL?
 
     private(set) var fileURL: URL?
-    private var document: Z21ArchiveDocument?
-    private var repository: Z21Repository?
-    private var pendingImportLocomotive: Locomotive?
+    private var documentSession: DocumentSession?
+    private var editRevision: UInt64 = 0
     private let continuityCamera = ContinuityCameraCapture()
+    private let ocrAIService = OCRAIService()
+    let importCoordinator = ImportCoordinator()
 
     var selectedIndex: Int? { selection.flatMap { id in locomotives.firstIndex { $0.id == id } } }
     var selected: Locomotive? { selectedIndex.map { locomotives[$0] } }
+    var importTarget: Locomotive? { importTargetIndex.map { locomotives[$0] } }
     var filteredLocomotives: [Locomotive] {
         guard !searchText.isEmpty else { return locomotives }
         return locomotives.filter { $0.name.localizedCaseInsensitiveContains(searchText) || String($0.address).contains(searchText) }
     }
     var availableIcons: [String] { IconCatalog.icons() }
     func open(_ url: URL) {
-        guard confirmAbandonChanges() else { return }
-        perform {
-            let document = try Z21ArchiveDocument(url: url)
-            let repository = try Z21Repository(databaseURL: document.databaseURL)
-            let values = try repository.loadLocomotives()
-            self.document = document
-            self.repository = repository
-            self.fileURL = url
-            self.locomotives = values
-            self.selection = values.first?.id
-            self.isDirty = false
-            self.appStatus = .success("Loaded \(values.count) locomotives from \(url.lastPathComponent)")
-            NSDocumentController.shared.noteNewRecentDocumentURL(url)
+        requestAbandonChanges { [weak self] proceed in
+            guard proceed else { return }
+            self?.openConfirmed(url)
+        }
+    }
+
+    private func openConfirmed(_ url: URL) {
+        guard !isBusy else {
+            present(Z21Error.validation("Wait for the current operation to finish before opening another archive."))
+            return
+        }
+        isBusy = true
+        appStatus = .working("Opening \(url.lastPathComponent)…")
+        Task {
+            do {
+                let opened = try await DocumentSession.open(url)
+                documentSession = opened.session
+                fileURL = url
+                locomotives = opened.locomotives
+                selection = opened.locomotives.first?.id
+                editRevision = 0
+                isDirty = false
+                appStatus = .success("Loaded \(opened.locomotives.count) locomotives from \(url.lastPathComponent)")
+                NSDocumentController.shared.noteNewRecentDocumentURL(url)
+            } catch { present(error) }
+            isBusy = false
         }
     }
 
@@ -58,20 +73,67 @@ final class AppState: ObservableObject {
     }
 
     func save() {
-        perform {
-            guard let repository, let document else { throw Z21Error.validation("No Z21 file is open.") }
-            for index in locomotives.indices {
-                locomotives[index].categories = LocomotiveValidator.normalizeCategories(locomotives[index].categories)
+        save(completion: nil)
+    }
+
+    func save(completion: ((Bool) -> Void)?) {
+        guard !isBusy else {
+            present(Z21Error.validation("Wait for the current operation to finish before saving."))
+            completion?(false)
+            return
+        }
+        guard let documentSession else {
+            present(Z21Error.validation("No Z21 file is open."))
+            completion?(false)
+            return
+        }
+        var snapshot = locomotives
+        do {
+            for index in snapshot.indices {
+                snapshot[index].categories = LocomotiveValidator.normalizeCategories(snapshot[index].categories)
             }
-            for locomotive in locomotives { try LocomotiveValidator.validate(locomotive, among: locomotives) }
-            try repository.save(&locomotives)
-            try document.write()
-            isDirty = false
-            appStatus = .success("Saved \(locomotives.count) locomotives")
+            for locomotive in snapshot { try LocomotiveValidator.validate(locomotive, among: snapshot) }
+        } catch {
+            present(error)
+            completion?(false)
+            return
+        }
+
+        let savingRevision = editRevision
+        isBusy = true
+        appStatus = .working("Saving \(snapshot.count) locomotives…")
+        Task {
+            do {
+                let saved = try await documentSession.save(snapshot)
+                mergePersistentIdentity(from: saved)
+                if editRevision == savingRevision {
+                    locomotives = saved
+                    isDirty = false
+                }
+                appStatus = .success("Saved \(saved.count) locomotives")
+                isBusy = false
+                completion?(true)
+            } catch {
+                present(error)
+                isBusy = false
+                completion?(false)
+            }
         }
     }
 
-    func markDirty() { isDirty = true }
+    func markDirty() {
+        editRevision &+= 1
+        isDirty = true
+    }
+
+    private func mergePersistentIdentity(from saved: [Locomotive]) {
+        let identities = Dictionary(uniqueKeysWithValues: saved.map { ($0.id, ($0.vehicleID, $0.isNewImport)) })
+        for index in locomotives.indices {
+            guard let identity = identities[locomotives[index].id] else { continue }
+            locomotives[index].vehicleID = identity.0
+            locomotives[index].isNewImport = identity.1
+        }
+    }
 
     func addLocomotive() {
         let used = Set(locomotives.map(\.address))
@@ -79,7 +141,7 @@ final class AppState: ObservableObject {
         let locomotive = Locomotive.blank(address: address)
         locomotives.append(locomotive)
         selection = locomotive.id
-        isDirty = true
+        markDirty()
         appStatus = .warning("Created locomotive at address \(address)")
     }
 
@@ -87,34 +149,52 @@ final class AppState: ObservableObject {
         guard let index = selectedIndex else { return }
         locomotives.remove(at: index)
         selection = locomotives.indices.contains(index) ? locomotives[index].id : locomotives.last?.id
-        isDirty = true
+        markDirty()
         appStatus = .warning("Locomotive removed; click Save to persist")
     }
 
     func importLocomotive() {
-        guard let document else { return }
+        guard let documentSession, !isBusy else { return }
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.init(filenameExtension: "z21loco")!]
         if panel.runModal() == .OK, let url = panel.url {
-            perform {
-                let value = try ImportExportService.importLocomotive(from: url, into: document, existing: locomotives)
-                locomotives.append(value)
-                selection = value.id
-                isDirty = true
-                appStatus = .warning("Imported \(value.name); click Save to persist")
+            let existing = locomotives
+            isBusy = true
+            appStatus = .working("Importing \(url.lastPathComponent)…")
+            Task {
+                do {
+                    let value = try await documentSession.importLocomotive(from: url, existing: existing)
+                    locomotives.append(value)
+                    selection = value.id
+                    markDirty()
+                    appStatus = .warning("Imported \(value.name); click Save to persist")
+                } catch { present(error) }
+                isBusy = false
             }
         }
     }
 
     func exportSelected(airDrop: Bool = false) {
-        guard let locomotive = selected, let source = fileURL else { return }
+        guard let locomotive = selected, let documentSession, !isBusy else { return }
         if airDrop {
-            perform {
+            do {
                 let filename = "\(safeFilename(locomotive.name)).z21loco"
                 let target = try ImportExportService.airDropExportURL(filename: filename)
-                try ImportExportService.exportLocomotive(locomotive, from: source, to: target)
-                try ImportExportService.shareViaAirDrop(target)
-                appStatus = .information("Choose an AirDrop recipient for \(filename)")
+                isBusy = true
+                appStatus = .working("Preparing \(filename)…")
+                Task {
+                    do {
+                        try await documentSession.exportLocomotive(locomotive, to: target)
+                        try ImportExportService.shareViaAirDrop(target)
+                        appStatus = .information("Choose an AirDrop recipient for \(filename)")
+                    } catch {
+                        AirDropShareManager.cleanupTemporaryExport(at: target)
+                        present(error)
+                    }
+                    isBusy = false
+                }
+            } catch {
+                present(error)
             }
             return
         }
@@ -123,9 +203,14 @@ final class AppState: ObservableObject {
         panel.allowedContentTypes = [.init(filenameExtension: "z21loco")!]
         panel.nameFieldStringValue = "\(safeFilename(locomotive.name)).z21loco"
         if panel.runModal() == .OK, let target = panel.url {
-            perform {
-                try ImportExportService.exportLocomotive(locomotive, from: source, to: target)
-                appStatus = .success("Exported \(locomotive.name)")
+            isBusy = true
+            appStatus = .working("Exporting \(locomotive.name)…")
+            Task {
+                do {
+                    try await documentSession.exportLocomotive(locomotive, to: target)
+                    appStatus = .success("Exported \(locomotive.name)")
+                } catch { present(error) }
+                isBusy = false
             }
         }
     }
@@ -146,7 +231,7 @@ final class AppState: ObservableObject {
                 self.appStatus = .failure("The iPhone capture could not be received")
                 return
             }
-            self.recognize(url, functionTable: functionTable)
+            self.recognize(url, functionTable: functionTable, deleteSourceWhenFinished: true)
         }
         if started {
             let target = functionTable ? "the function table" : "the manual"
@@ -158,7 +243,7 @@ final class AppState: ObservableObject {
     }
 
     func importLocomotiveImage() {
-        guard selectedIndex != nil, document != nil else { return }
+        guard selectedIndex != nil, documentSession != nil else { return }
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.png, .jpeg, .tiff, .heic]
         if panel.runModal() == .OK, let url = panel.url {
@@ -167,33 +252,58 @@ final class AppState: ObservableObject {
     }
 
     func applyCroppedImage(_ source: URL, rect: CGRect) {
-        guard let index = selectedIndex, let document else { return }
-        perform {
-            let cropped = try ImageCropper.crop(source, normalized: rect)
-            defer { try? FileManager.default.removeItem(at: cropped) }
-            locomotives[index].imageName = try document.addImage(from: cropped)
-            cropSourceURL = nil
-            isDirty = true
-            appStatus = .warning("Updated locomotive image; click Save to persist")
+        guard let targetID = selection, let documentSession, !isBusy else { return }
+        isBusy = true
+        appStatus = .working("Processing locomotive image…")
+        Task {
+            var cropped: URL?
+            do {
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try ImageCropper.crop(source, normalized: rect)
+                }.value
+                cropped = result
+                let imageName = try await documentSession.addImage(from: result)
+                guard let index = locomotives.firstIndex(where: { $0.id == targetID }) else {
+                    throw Z21Error.validation("The locomotive selected for this image is no longer available.")
+                }
+                locomotives[index].imageName = imageName
+                cropSourceURL = nil
+                markDirty()
+                appStatus = .warning("Updated locomotive image; click Save to persist")
+            } catch { present(error) }
+            if let cropped { try? FileManager.default.removeItem(at: cropped) }
+            isBusy = false
         }
     }
 
-    func recognize(_ url: URL, functionTable: Bool) {
-        guard selectedIndex != nil else { return }
+    func recognize(_ url: URL, functionTable: Bool, deleteSourceWhenFinished: Bool = false) {
+        guard let targetID = selection, let target = selected else { return }
+        let targetName = target.name
         isBusy = true
         appStatus = .working("Recognizing text with Apple Vision…")
         Task {
+            defer {
+                if deleteSourceWhenFinished { try? FileManager.default.removeItem(at: url) }
+            }
             do {
-                let result = try await Task.detached { try AppleVisionOCR.recognize(url) }.value
+                let result = try await ocrAIService.recognize(url)
+                let proposals = functionTable
+                    ? try await ocrAIService.extractFunctions(result: result, availableIcons: availableIcons)
+                    : []
+                guard locomotives.contains(where: { $0.id == targetID }) else {
+                    throw Z21Error.validation("The locomotive selected for this import is no longer available.")
+                }
                 ocrText = result.text
                 if functionTable {
-                    try await analyzeFunctions(result)
+                    functionProposals = proposals
                     importReviewSession = ImportReviewSession(source: url.lastPathComponent,
-                                                              target: selected?.name ?? "Locomotive",
+                                                              targetID: targetID,
+                                                              target: targetName,
                                                               stage: .functionChanges)
                 } else {
                     importReviewSession = ImportReviewSession(source: url.lastPathComponent,
-                                                              target: selected?.name ?? "Locomotive",
+                                                              targetID: targetID,
+                                                              target: targetName,
                                                               stage: .ocrText)
                 }
                 appStatus = .success("Recognized \(result.pages.count) page(s)")
@@ -203,13 +313,19 @@ final class AppState: ObservableObject {
     }
 
     func analyzeFields() {
-        guard let locomotive = selected else { return }
+        guard let session = importReviewSession, let locomotive = importTarget else { return }
+        let sessionID = session.id
+        let recognizedText = ocrText
         appStatus = .working("Analyzing recognized details with DeepSeek…")
+        isBusy = true
         Task {
             do {
-                guard let key = try DeepSeekKeychain.get() else { throw Z21Error.service("Add a DeepSeek API key in Settings first.") }
-                isBusy = true
-                fieldProposals = try await DeepSeekService(apiKey: key).extractFields(text: ocrText, existing: locomotive)
+                let proposals = try await ocrAIService.extractFields(text: recognizedText, existing: locomotive)
+                guard importReviewSession?.id == sessionID, importTarget != nil else {
+                    isBusy = false
+                    return
+                }
+                fieldProposals = proposals
                 importReviewSession?.stage = .fieldChanges
                 appStatus = .information("Review \(fieldProposals.count) proposed detail changes")
             } catch { present(error) }
@@ -218,16 +334,22 @@ final class AppState: ObservableObject {
     }
 
     func applyFields(_ selectedProposals: Set<UUID>) {
-        guard let index = selectedIndex else { return }
+        guard let index = importTargetIndex else {
+            present(Z21Error.validation("The locomotive selected for this import is no longer available."))
+            return
+        }
         for proposal in fieldProposals where selectedProposals.contains(proposal.id) {
             apply(proposal, to: &locomotives[index])
         }
         finishImport("Applied \(selectedProposals.count) detail changes")
-        isDirty = true
+        if !selectedProposals.isEmpty { markDirty() }
     }
 
     func applyFunctions(_ selectedNumbers: Set<Int>) {
-        guard let index = selectedIndex else { return }
+        guard let index = importTargetIndex else {
+            present(Z21Error.validation("The locomotive selected for this import is no longer available."))
+            return
+        }
         for proposal in functionProposals where selectedNumbers.contains(proposal.number) {
             let info = FunctionInfo(number: proposal.number, imageName: proposal.iconName,
                                     shortcut: FunctionMatcher.shortcut(description: proposal.name, icon: proposal.iconName),
@@ -238,22 +360,20 @@ final class AppState: ObservableObject {
         }
         normalizePositions(&locomotives[index].functions)
         finishImport("Applied \(selectedNumbers.count) function changes")
-        isDirty = true
+        if !selectedNumbers.isEmpty { markDirty() }
     }
 
-    func imageURL(for locomotive: Locomotive) -> URL? { document?.imageURL(named: locomotive.imageName) }
-
-    private func analyzeFunctions(_ result: OCRResult) async throws {
-        guard let key = try DeepSeekKeychain.get() else { throw Z21Error.service("Add a DeepSeek API key in Settings first.") }
-        functionProposals = try await DeepSeekService(apiKey: key).extractFunctions(result: result, availableIcons: availableIcons)
-    }
+    func imageURL(for locomotive: Locomotive) -> URL? { documentSession?.imageURL(named: locomotive.imageName) }
 
     private func chooseJSON(functionsOnly: Bool) {
-        guard let index = selectedIndex else { return }
+        guard let targetID = selection else { return }
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.json]
         if panel.runModal() == .OK, let url = panel.url {
             perform {
+                guard let index = locomotives.firstIndex(where: { $0.id == targetID }) else {
+                    throw Z21Error.validation("The locomotive selected for this import is no longer available.")
+                }
                 let original = locomotives[index]
                 var proposed = original
                 let data = try Data(contentsOf: url)
@@ -267,14 +387,15 @@ final class AppState: ObservableObject {
                     }
                 } else {
                     try JSONImporter.applyLocomotiveJSON(data, to: &proposed)
-                    pendingFieldChanges = Self.fieldChanges(from: original, to: proposed)
+                    pendingFieldChanges = importCoordinator.fieldChanges(from: original, to: proposed)
                     guard !pendingFieldChanges.isEmpty else {
                         throw Z21Error.validation("The JSON file does not contain any detail changes.")
                     }
                 }
-                pendingImportLocomotive = proposed
+                importCoordinator.pendingLocomotive = proposed
                 importReviewSession = ImportReviewSession(
                     source: url.lastPathComponent,
+                    targetID: targetID,
                     target: original.name,
                     stage: functionsOnly ? .jsonFunctionChanges : .jsonFieldChanges)
                 appStatus = .information("Review changes from \(url.lastPathComponent)")
@@ -283,27 +404,33 @@ final class AppState: ObservableObject {
     }
 
     func applyJSONFields(_ keys: Set<String>) {
-        guard let index = selectedIndex, let proposed = pendingImportLocomotive else { return }
-        for key in keys { Self.applyField(key, from: proposed, to: &locomotives[index]) }
-        isDirty = !keys.isEmpty || isDirty
+        guard let index = importTargetIndex, let proposed = importCoordinator.pendingLocomotive else {
+            present(Z21Error.validation("The locomotive selected for this import is no longer available."))
+            return
+        }
+        for key in keys { importCoordinator.applyField(key, from: proposed, to: &locomotives[index]) }
+        if !keys.isEmpty { markDirty() }
         finishImport("Applied \(keys.count) JSON detail changes")
     }
 
     func applyJSONFunctions(_ numbers: Set<Int>) {
-        guard let index = selectedIndex, let proposed = pendingImportLocomotive else { return }
+        guard let index = importTargetIndex, let proposed = importCoordinator.pendingLocomotive else {
+            present(Z21Error.validation("The locomotive selected for this import is no longer available."))
+            return
+        }
         for value in proposed.functions where numbers.contains(value.number) {
             if let existing = locomotives[index].functions.firstIndex(where: { $0.number == value.number }) {
                 locomotives[index].functions[existing] = value
             } else { locomotives[index].functions.append(value) }
         }
         normalizePositions(&locomotives[index].functions)
-        isDirty = !numbers.isEmpty || isDirty
+        if !numbers.isEmpty { markDirty() }
         finishImport("Applied \(numbers.count) JSON function changes")
     }
 
     func cancelImportReview() {
         importReviewSession = nil
-        pendingImportLocomotive = nil
+        importCoordinator.reset()
         pendingFieldChanges = []
         pendingFunctionChanges = []
         appStatus = .information("Import review cancelled; no changes applied")
@@ -311,7 +438,7 @@ final class AppState: ObservableObject {
 
     private func finishImport(_ message: String) {
         importReviewSession = nil
-        pendingImportLocomotive = nil
+        importCoordinator.reset()
         pendingFieldChanges = []
         pendingFunctionChanges = []
         appStatus = .warning(message + "; click Save to persist")
@@ -321,59 +448,20 @@ final class AppState: ObservableObject {
         do { try action() } catch { present(error) }
     }
 
-    private static func fieldChanges(from current: Locomotive, to proposed: Locomotive) -> [ImportFieldChange] {
-        let values: [(String, String, String, String)] = [
-            ("name", "Name", current.name, proposed.name),
-            ("address", "Address", String(current.address), String(proposed.address)),
-            ("speed", "Max Speed", String(current.speed), String(proposed.speed)),
-            ("speedDisplay", "Speed Display", String(current.speedDisplay), String(proposed.speedDisplay)),
-            ("fullName", "Full Name", current.fullName, proposed.fullName),
-            ("railway", "Railway", current.railway, proposed.railway),
-            ("articleNumber", "Article Number", current.articleNumber, proposed.articleNumber),
-            ("decoderType", "Decoder / Interface", current.decoderType, proposed.decoderType),
-            ("buildYear", "Build Year", current.buildYear, proposed.buildYear),
-            ("modelBufferLength", "Model Buffer Length", current.modelBufferLength, proposed.modelBufferLength),
-            ("serviceWeight", "Service Weight", current.serviceWeight, proposed.serviceWeight),
-            ("modelWeight", "Model Weight", current.modelWeight, proposed.modelWeight),
-            ("rmin", "Minimum Radius", current.rmin, proposed.rmin),
-            ("ip", "IP Address", current.ip, proposed.ip),
-            ("driversCab", "Driver’s Cab", current.driversCab, proposed.driversCab),
-            ("description", "Description", current.description, proposed.description)
-        ]
-        return values.compactMap { key, label, old, new in
-            old == new ? nil : ImportFieldChange(id: key, label: label, current: old, proposed: new)
-        }
+    private var importTargetIndex: Int? {
+        importCoordinator.targetIndex(for: importReviewSession, in: locomotives)
     }
 
-    private static func applyField(_ key: String, from source: Locomotive, to target: inout Locomotive) {
-        switch key {
-        case "name": target.name = source.name
-        case "address": target.address = source.address
-        case "speed": target.speed = source.speed
-        case "speedDisplay": target.speedDisplay = source.speedDisplay
-        case "fullName": target.fullName = source.fullName
-        case "railway": target.railway = source.railway
-        case "articleNumber": target.articleNumber = source.articleNumber
-        case "decoderType": target.decoderType = source.decoderType
-        case "buildYear": target.buildYear = source.buildYear
-        case "modelBufferLength": target.modelBufferLength = source.modelBufferLength
-        case "serviceWeight": target.serviceWeight = source.serviceWeight
-        case "modelWeight": target.modelWeight = source.modelWeight
-        case "rmin": target.rmin = source.rmin
-        case "ip": target.ip = source.ip
-        case "driversCab": target.driversCab = source.driversCab
-        case "description": target.description = source.description
-        default: break
-        }
-    }
-
-    private func present(_ error: Error) {
+    func present(_ error: Error) {
         errorMessage = error.localizedDescription
         appStatus = .failure(error.localizedDescription)
     }
 
-    func confirmAbandonChanges() -> Bool {
-        guard isDirty else { return true }
+    func requestAbandonChanges(markDiscarded: Bool = false, completion: @escaping (Bool) -> Void) {
+        guard isDirty else {
+            completion(true)
+            return
+        }
         let alert = NSAlert()
         alert.messageText = "Save changes before continuing?"
         alert.informativeText = "The current Z21 archive contains unsaved changes."
@@ -382,12 +470,12 @@ final class AppState: ObservableObject {
         alert.addButton(withTitle: "Cancel")
         switch alert.runModal() {
         case .alertFirstButtonReturn:
-            save()
-            return !isDirty
+            save(completion: completion)
         case .alertSecondButtonReturn:
-            return true
+            if markDiscarded { isDirty = false }
+            completion(true)
         default:
-            return false
+            completion(false)
         }
     }
 }

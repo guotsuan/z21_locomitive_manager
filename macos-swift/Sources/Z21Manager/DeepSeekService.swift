@@ -1,6 +1,6 @@
 import Foundation
 
-struct FieldProposal: Identifiable, Hashable {
+struct FieldProposal: Identifiable, Hashable, Sendable {
     let id = UUID()
     let field: String
     let value: String
@@ -9,7 +9,7 @@ struct FieldProposal: Identifiable, Hashable {
     let page: Int?
 }
 
-struct FunctionProposal: Identifiable, Hashable {
+struct FunctionProposal: Identifiable, Hashable, Sendable {
     var id: Int { number }
     let number: Int
     let name: String
