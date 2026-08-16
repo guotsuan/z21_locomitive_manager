@@ -1,16 +1,31 @@
-# Z21 Locomotive Manager
+# Z21 Locomotive Manager — Roco Z21 Editor, DCC Functions & OCR
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![macOS](https://img.shields.io/badge/macOS-Continuity%20Camera-000000?logo=apple&logoColor=white)](https://www.apple.com/macos/)
-[![License: BSD 3-Clause](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](#-license)
+[![License: BSD 3-Clause](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](#license)
 
-A macOS-friendly Python GUI and CLI for managing Roco Z21 locomotive files,
-DCC function mappings, icons, OCR scanning, and Z21 App import/export.
+Z21 Locomotive Manager is an open-source, macOS-friendly Python desktop app and
+CLI for editing Roco Z21 locomotive databases. It manages `.z21` archives,
+individual `.z21loco` files, DCC F0–F32 function mappings and icons, and can
+extract locomotive details or function tables from manuals with OCR.
 
-Built for Roco Z21, model railway, model train, locomotive, DCC, train control,
-macOS, CustomTkinter, OCR, Continuity Camera, and AirDrop workflows.
+Use it to prepare model railway locomotives on a Mac, review every change before
+saving, and share completed locomotive files with the Z21 App through AirDrop.
 
-## About
+## Contents
+
+- [Why use Z21 Locomotive Manager?](#why-use-z21-locomotive-manager)
+- [Features](#features)
+- [Supported files and workflows](#supported-files-and-workflows)
+- [Quick start](#quick-start)
+- [Installation and usage](#installation-and-usage)
+- [OCR function-table scanning](#ocr-function-table-scanning)
+- [Project structure and architecture](#project-structure-and-architecture)
+- [Frequently asked questions](#frequently-asked-questions)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Why use Z21 Locomotive Manager?
 
 Roco locomotives can usually be added to the Z21 App from its online database,
 but models from other manufacturers often require locomotive details and DCC
@@ -24,7 +39,20 @@ individual `.z21loco` import/export. A CLI is included for inspection and data
 export. On macOS, completed locomotives can be shared back to the Z21 App with
 AirDrop.
 
-## ✨ Features
+Typical uses include:
+
+- editing locomotive names, addresses, decoder settings, categories, and other
+  metadata stored in a Roco Z21 archive;
+- maintaining DCC function assignments from F0 through F32 with Z21-compatible
+  icons, labels, and button behavior;
+- scanning multilingual locomotive manuals or function tables with Apple Vision
+  OCR and reviewing AI-assisted suggestions;
+- importing or exporting a single locomotive as a `.z21loco` file for the Z21
+  App; and
+- inspecting a Z21 database or exporting its parsed content to JSON from the
+  command line.
+
+## Features
 
 - **Z21 Management**: Read, edit, validate, and safely write Z21 locomotive
   archives while preserving unknown archive members and SQLite data.
@@ -46,6 +74,19 @@ AirDrop.
 - **Controlled Categories**: Prefer `Electrical`, `Steam`, `Diesel`, or
   `Train Bus`; custom types require explicit evidence and manual review.
 
+## Supported files and workflows
+
+| Input or output | Support |
+| --- | --- |
+| `.z21` archive | Read, validate, edit, and safely save the locomotive database while preserving unknown ZIP members. |
+| `.z21loco` file | Import or export an individual locomotive and share it with the Z21 App through AirDrop. |
+| PDF, JPEG, or PNG manual | Recognize locomotive fields and DCC function tables with Apple Vision OCR on macOS. |
+| SQLite database | Read and update the `Loco.sqlite` data stored inside a Z21 archive. |
+| JSON | Export parsed locomotive data from the CLI for inspection or further processing. |
+
+The desktop interface and Continuity Camera integration target macOS. Core Z21
+parsing and CLI workflows are implemented in Python and can be used separately
+from the native camera features.
 
 ## Quick Start
 
@@ -64,7 +105,7 @@ To inspect the command-line interface:
 uv run z21lm --help
 ```
 
-## 📋 Requirements
+## System Requirements
 
 - Python 3.10 or higher
 - customtkinter>=5.0.0
@@ -74,7 +115,7 @@ uv run z21lm --help
 - pyobjc-framework-Cocoa>=9.0.0,<12.0.0
 - Xcode Command Line Tools (macOS, used to build the Continuity Camera helper)
 
-## 🚀 Usage
+## Installation and Usage
 
 Install all locked dependencies with uv:
 
@@ -138,7 +179,7 @@ field extraction. Suggestions include confidence and source evidence; existing
 field values are not selected for replacement by default, and nothing is saved
 to the Z21 archive until **Save Changes** is clicked.
 
-### Scanning a function table
+### OCR function-table scanning
 
 1. Select a locomotive and open the **Functions** tab.
 2. Click **Scan from iphone** and scan the manual page containing the function
@@ -175,7 +216,7 @@ type may use a short English Title Case name such as `Battery Electric`; custom
 AI suggestions are deliberately low-confidence and require manual selection.
 
 
-## 📁 Project Structure
+## Project Structure and Architecture
 
 ```
 z21_locomotive_manager/
@@ -225,8 +266,40 @@ The CLI and GUI depend on the parser facade rather than ZIP or SQLite details.
 - Example: `z21_new.z21`
 - Successfully parsed: 65+ locomotives
 
+## Frequently Asked Questions
 
-## 🤝 Contributing
+### What is a `.z21` file?
+
+In the format supported by this project, a `.z21` file is a ZIP archive that
+contains the Z21 locomotive database, including `Loco.sqlite`. The manager
+preserves archive members it does not understand when writing changes.
+
+### Can I edit Roco Z21 locomotive functions on macOS?
+
+Yes. The GUI can edit locomotive details and DCC F0–F32 function mappings,
+including function icons, shortcuts, button types, and ordering. You can review
+changes before saving them back to the Z21 archive.
+
+### Can it scan a locomotive manual or DCC function table?
+
+Yes. On macOS, the app uses Apple Vision for local OCR and can receive a scan or
+photo through Continuity Camera. If you explicitly choose DeepSeek analysis,
+only the editable OCR text and layout are sent for structured extraction; the
+captured image itself is not uploaded by this application.
+
+### Does it work with the Z21 App?
+
+The manager can import and export individual `.z21loco` files. On macOS, an
+exported locomotive can be sent to a nearby Apple device with AirDrop and then
+opened in the Z21 App.
+
+### Is this an official Roco or Z21 product?
+
+No. Z21 Locomotive Manager is an independent open-source project and is not
+affiliated with Roco or Z21.
+
+
+## Contributing
 
 Contributions are welcome, especially improvements to Z21 format compatibility,
 platform support, OCR accuracy, DCC function matching, validation, and tests.
@@ -246,7 +319,7 @@ platform support, OCR accuracy, DCC function matching, validation, and tests.
 Please avoid committing personal `.z21` archives, API keys, generated OCR data,
 or other private model-railway data.
 
-## 📄 License
+## License
 
 This project is licensed under the BSD 3-Clause License.
 
