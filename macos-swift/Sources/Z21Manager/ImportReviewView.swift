@@ -70,17 +70,20 @@ struct ImportReviewView: View {
 
     private var functionProposalTable: some View {
         Table($state.functionProposals) {
-            TableColumn("") { $item in Toggle("Select F\(item.number) change", isOn: functionToggle(item.number)).labelsHidden() }.width(28)
+            TableColumn("") { $item in
+                Toggle("Select F\(item.number) change", isOn: functionToggle(item.number)).labelsHidden()
+            }.width(28)
             TableColumn("F") { $item in Text("F\(item.number)").fontWeight(.semibold) }.width(45)
             TableColumn("Change") { $item in changeLabel(item.number) }.width(75)
             TableColumn("Description") { $item in Text(item.name) }.width(min: 150)
             TableColumn("Icon") { $item in
-                Picker("Icon", selection: $item.iconName) { ForEach(state.availableIcons, id: \.self, content: Text.init) }.labelsHidden()
-            }.width(min: 140)
+                FunctionIconPicker(iconName: $item.iconName, availableIcons: state.availableIcons)
+            }.width(min: 190)
             TableColumn("Behavior") { $item in behaviorPicker($item.buttonType) }.width(105)
             TableColumn("Confidence") { $item in ConfidenceLabel(value: item.confidence) }.width(120)
             TableColumn("Evidence") { $item in Text(item.evidence).lineLimit(1) }
         }
+        .overlay(alignment: .topLeading) { selectAllFunctionsToggle }
     }
 
     private var jsonFieldTable: some View {
@@ -95,15 +98,18 @@ struct ImportReviewView: View {
 
     private var jsonFunctionTable: some View {
         Table($state.pendingFunctionChanges) {
-            TableColumn("") { $item in Toggle("Select F\(item.number) change", isOn: functionToggle(item.number)).labelsHidden() }.width(28)
+            TableColumn("") { $item in
+                Toggle("Select F\(item.number) change", isOn: functionToggle(item.number)).labelsHidden()
+            }.width(28)
             TableColumn("F") { $item in Text("F\(item.number)").fontWeight(.semibold) }.width(45)
             TableColumn("Change") { $item in changeLabel(item.number) }.width(75)
             TableColumn("Shortcut") { $item in Text(item.shortcut) }
             TableColumn("Icon") { $item in
-                Picker("Icon", selection: $item.imageName) { ForEach(state.availableIcons, id: \.self, content: Text.init) }.labelsHidden()
-            }.width(min: 140)
+                FunctionIconPicker(iconName: $item.imageName, availableIcons: state.availableIcons)
+            }.width(min: 190)
             TableColumn("Behavior") { $item in behaviorPicker($item.buttonType) }.width(105)
         }
+        .overlay(alignment: .topLeading) { selectAllFunctionsToggle }
     }
 
     private var footer: some View {
@@ -139,7 +145,10 @@ struct ImportReviewView: View {
         case .fieldChanges:
             selectedFields = Set(state.fieldProposals.map(\.id))
         case .functionChanges:
-            selectNewFunctions(state.functionProposals.map(\.number))
+            selectedFunctions = FunctionReviewSelection.defaults(
+                for: state.functionProposals,
+                existingNumbers: existingFunctionNumbers
+            )
         case .jsonFieldChanges:
             selectedJSONFields = Set(state.pendingFieldChanges.map(\.id))
         case .jsonFunctionChanges:
@@ -149,8 +158,45 @@ struct ImportReviewView: View {
     }
 
     private func selectNewFunctions(_ numbers: [Int]) {
-        let existing = Set(state.importTarget?.functions.map(\.number) ?? [])
-        selectedFunctions = Set(numbers).subtracting(existing)
+        selectedFunctions = Set(numbers).subtracting(existingFunctionNumbers)
+    }
+
+    private var existingFunctionNumbers: Set<Int> {
+        Set(state.importTarget?.functions.map(\.number) ?? [])
+    }
+
+    private var displayedFunctionNumbers: Set<Int> {
+        switch session?.stage {
+        case .functionChanges: Set(state.functionProposals.map(\.number))
+        case .jsonFunctionChanges: Set(state.pendingFunctionChanges.map(\.number))
+        default: []
+        }
+    }
+
+    private var allFunctionsToggle: Binding<Bool> {
+        Binding(
+            get: {
+                let numbers = displayedFunctionNumbers
+                return !numbers.isEmpty && selectedFunctions.isSuperset(of: numbers)
+            },
+            set: { enabled in
+                selectedFunctions = FunctionReviewSelection.settingAll(
+                    enabled,
+                    numbers: displayedFunctionNumbers,
+                    current: selectedFunctions
+                )
+            }
+        )
+    }
+
+    private var selectAllFunctionsToggle: some View {
+        Toggle("Select all function changes", isOn: allFunctionsToggle)
+            .labelsHidden()
+            .toggleStyle(.checkbox)
+            .controlSize(.small)
+            .padding(.leading, 9)
+            .padding(.top, 7)
+            .help("Select or clear all function changes")
     }
 
     private func applySelection() {
@@ -188,6 +234,38 @@ struct ImportReviewView: View {
         Binding(get: { selectedJSONFields.contains(id) }, set: { enabled in
             if enabled { selectedJSONFields.insert(id) } else { selectedJSONFields.remove(id) }
         })
+    }
+}
+
+private struct FunctionIconPicker: View {
+    @Binding var iconName: String
+    let availableIcons: [String]
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Group {
+                FunctionIconThumbnail(iconName: iconName, size: 30)
+            }
+            .frame(width: 30, height: 30)
+            .padding(3)
+            .background(.background.secondary, in: RoundedRectangle(cornerRadius: 6))
+            .accessibilityHidden(true)
+
+            Picker("Icon", selection: $iconName) {
+                ForEach(availableIcons, id: \.self) { availableIcon in
+                    HStack(spacing: 6) {
+                        FunctionIconThumbnail(iconName: availableIcon, size: 16)
+                        Text(availableIcon)
+                    }
+                    .tag(availableIcon)
+                }
+            }
+            .labelsHidden()
+            .frame(maxWidth: .infinity)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Icon")
+        .accessibilityValue(iconName)
     }
 }
 

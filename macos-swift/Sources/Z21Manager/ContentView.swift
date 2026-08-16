@@ -10,8 +10,12 @@ struct ContentView: View {
                 LibrarySidebar()
                     .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 380)
             } detail: {
-                if let index = state.selectedIndex {
-                    LocomotiveDetail(locomotive: binding(index))
+                if let id = state.selection,
+                   let fallback = state.locomotives.first(where: { $0.id == id }) {
+                    LocomotiveDetail(
+                        locomotive: LocomotiveDetailBinding.make(id: id, fallback: fallback, state: state)
+                    )
+                    .id(id)
                 } else {
                     ContentUnavailableView("No Locomotive Selected", systemImage: "tram",
                                            description: Text(state.fileURL == nil ? "Open a Z21 archive to begin." : "Choose or create a locomotive."))
@@ -74,8 +78,21 @@ struct ContentView: View {
         }
     }
 
-    private func binding(_ index: Int) -> Binding<Locomotive> {
-        Binding(get: { state.locomotives[index] }, set: { state.locomotives[index] = $0; state.markDirty() })
+}
+
+@MainActor
+enum LocomotiveDetailBinding {
+    static func make(id: UUID, fallback: Locomotive, state: AppState) -> Binding<Locomotive> {
+        Binding(
+            get: {
+                state.locomotives.first(where: { $0.id == id }) ?? fallback
+            },
+            set: { updated in
+                guard let index = state.locomotives.firstIndex(where: { $0.id == id }) else { return }
+                state.locomotives[index] = updated
+                state.markDirty()
+            }
+        )
     }
 }
 

@@ -87,6 +87,52 @@ final class Z21ManagerTests: XCTestCase {
         XCTAssertEqual(FunctionMatcher.match("Open door", available: ["neutral", "door_open"]), "door_open")
     }
 
+    func testFunctionMatcherUsesSandenIconForSandingTerms() {
+        let icons = ["neutral", "sanden", "sound1"]
+        XCTAssertEqual(FunctionMatcher.match("Sanding", available: icons), "sanden")
+        XCTAssertEqual(FunctionMatcher.match("Sandstreuer", available: icons), "sanden")
+        XCTAssertEqual(FunctionMatcher.match("Sablage", available: icons), "sanden")
+        XCTAssertEqual(FunctionMatcher.match("撒砂", available: icons), "sanden")
+    }
+
+    func testFunctionMatcherUsesSound2IconForDriverNoise() {
+        let icons = ["neutral", "sound1", "sound2"]
+        XCTAssertEqual(FunctionMatcher.match("Driver noise", available: icons), "sound2")
+        XCTAssertEqual(FunctionMatcher.match("Driving sound", available: icons), "sound2")
+        XCTAssertEqual(FunctionMatcher.match("Fahrgeräusch", available: icons), "sound2")
+        XCTAssertEqual(FunctionMatcher.match("Bruit de conduite", available: icons), "sound2")
+    }
+
+    func testFunctionExtractionRequiresEnglishNamesAndOriginalEvidence() {
+        let prompt = DeepSeekService.functionExtractionPrompt
+        XCTAssertTrue(prompt.contains("name_en"))
+        XCTAssertTrue(prompt.contains("When no English description is present, translate"))
+        XCTAssertTrue(prompt.contains("original OCR language"))
+        XCTAssertEqual(FunctionMatcher.shortcut(description: "Driver noise", icon: "sound2"), "Drno")
+    }
+
+    func testFunctionReviewDoesNotSelectUnknownContentByDefault() {
+        let proposals = [
+            FunctionProposal(number: 0, name: "Front light", iconName: "light", buttonType: 0,
+                             confidence: 0.95, evidence: "F0 Licht"),
+            FunctionProposal(number: 1, name: "Unknown", iconName: "neutral", buttonType: 0,
+                             confidence: 0.2, evidence: "F1"),
+            FunctionProposal(number: 2, name: "No description", iconName: "neutral", buttonType: 0,
+                             confidence: 0.2, evidence: "F2")
+        ]
+
+        XCTAssertEqual(FunctionReviewSelection.defaults(for: proposals, existingNumbers: []), [0])
+        XCTAssertEqual(FunctionReviewSelection.defaults(for: proposals, existingNumbers: [0]), [])
+        XCTAssertEqual(
+            FunctionReviewSelection.settingAll(true, numbers: [0, 1, 2], current: []),
+            [0, 1, 2]
+        )
+        XCTAssertEqual(
+            FunctionReviewSelection.settingAll(false, numbers: [0, 1, 2], current: [0, 1, 2, 9]),
+            [9]
+        )
+    }
+
     func testFunctionAccessibilitySummaryContainsStateAndSelection() {
         let function = FunctionInfo(
             number: 7,
@@ -199,6 +245,26 @@ final class Z21ManagerTests: XCTestCase {
         XCTAssertEqual(state.locomotives[0].railway, "DB")
         XCTAssertEqual(state.locomotives[1].railway, "")
         XCTAssertTrue(state.isDirty)
+    }
+
+    @MainActor
+    func testLocomotiveDetailBindingSurvivesTargetDeletion() {
+        let state = AppState()
+        var locomotive = Locomotive.blank(address: 1)
+        locomotive.name = "Delete Me"
+        state.locomotives = [locomotive]
+        state.selection = locomotive.id
+        let binding = LocomotiveDetailBinding.make(id: locomotive.id, fallback: locomotive, state: state)
+
+        state.deleteSelected()
+
+        XCTAssertTrue(state.locomotives.isEmpty)
+        XCTAssertNil(state.selection)
+        XCTAssertEqual(binding.wrappedValue.id, locomotive.id)
+        var staleUpdate = binding.wrappedValue
+        staleUpdate.name = "Should Not Reappear"
+        binding.wrappedValue = staleUpdate
+        XCTAssertTrue(state.locomotives.isEmpty)
     }
 
     func testRepositorySavePreservesSQLiteUserVersion() throws {

@@ -30,3 +30,13 @@ struct ImportFieldChange: Identifiable, Hashable {
     let current: String
     let proposed: String
 }
+
+enum FunctionReviewSelection {
+    static func defaults(for proposals: [FunctionProposal], existingNumbers: Set<Int>) -> Set<Int> {
+        Set(proposals.lazy.filter(\.hasUsefulContent).map(\.number)).subtracting(existingNumbers)
+    }
+
+    static func settingAll(_ enabled: Bool, numbers: Set<Int>, current: Set<Int>) -> Set<Int> {
+        enabled ? current.union(numbers) : current.subtracting(numbers)
+    }
+}

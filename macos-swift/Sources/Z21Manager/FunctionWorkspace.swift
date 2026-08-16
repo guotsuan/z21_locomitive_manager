@@ -434,7 +434,13 @@ private struct FunctionInspector: View {
             Section("Function F\(function.number)") {
                 LabeledContent("Number", value: "F\(function.number)")
                 Picker("Icon", selection: $function.imageName) {
-                    ForEach(availableIcons, id: \.self, content: Text.init)
+                    ForEach(availableIcons, id: \.self) { iconName in
+                        HStack(spacing: 6) {
+                            FunctionIconThumbnail(iconName: iconName, size: 16)
+                            Text(iconName)
+                        }
+                        .tag(iconName)
+                    }
                 }
                 TextField("Shortcut", text: $function.shortcut)
             }
