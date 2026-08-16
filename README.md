@@ -1,9 +1,28 @@
 # Z21 Locomotive Manager
 
-## Purpose 
-For Roco products, it is easy to add your model train to your trains/locomotives library in the Z21 App by simply loading the details and function configuration from the online database. However, for model trains/locomotives from other manufacturers, the process is less efficient. You must manually enter all details and function mappings one by one in the Z21 App.
- 
-This Python application allows you to read, parse, and manage `.z21` files used by Roco's Z21 App more conveniently on your computer. With this tool, you can add locomotive data, browse function mappings, and easily export your locomotives back to the Z21 App via AirDrop if you are using a macOS computer.
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![macOS](https://img.shields.io/badge/macOS-Continuity%20Camera-000000?logo=apple&logoColor=white)](https://www.apple.com/macos/)
+[![License: BSD 3-Clause](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](#-license)
+
+A macOS-friendly Python GUI and CLI for managing Roco Z21 locomotive files,
+DCC function mappings, icons, OCR scanning, and Z21 App import/export.
+
+Built for Roco Z21, model railway, model train, locomotive, DCC, train control,
+macOS, CustomTkinter, OCR, Continuity Camera, and AirDrop workflows.
+
+## About
+
+Roco locomotives can usually be added to the Z21 App from its online database,
+but models from other manufacturers often require locomotive details and DCC
+function mappings to be entered manually. Z21 Locomotive Manager makes that
+work practical on a computer.
+
+The application reads, validates, edits, and writes `.z21` archives while
+preserving their SQLite data and unknown archive members. Its graphical browser
+supports locomotive details, function icons, OCR-assisted manual scanning, and
+individual `.z21loco` import/export. A CLI is included for inspection and data
+export. On macOS, completed locomotives can be shared back to the Z21 App with
+AirDrop.
 
 ## ✨ Features
 
@@ -28,6 +47,23 @@ This Python application allows you to read, parse, and manage `.z21` files used 
   `Train Bus`; custom types require explicit evidence and manual review.
 
 
+## Quick Start
+
+The recommended setup uses [uv](https://docs.astral.sh/uv/):
+
+```bash
+git clone https://github.com/guotsuan/z21_locomotive_manager.git
+cd z21_locomotive_manager
+uv sync
+uv run python tools/z21lm_gui.py z21_new.z21
+```
+
+To inspect the command-line interface:
+
+```bash
+uv run z21lm --help
+```
+
 ## 📋 Requirements
 
 - Python 3.10 or higher
@@ -40,37 +76,38 @@ This Python application allows you to read, parse, and manage `.z21` files used 
 
 ## 🚀 Usage
 
-1. **Clone the repository** (or navigate to the project directory)
-2. **Install dependencies with uv**:
+Install all locked dependencies with uv:
+
 ```bash
 uv sync
 ```
 
-   To use a specific Python interpreter:
+To use a specific Python interpreter:
+
 ```bash
-uv sync --python /Users/gq/miniforge3/bin/python
+uv sync --python /path/to/python3
 ```
 
-   Alternatively, install from `requirements.txt` with pip:
+Alternatively, install from `requirements.txt` with pip:
+
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
-3. Launch the graphical interface to browse locomotives:
+
+Launch the graphical interface:
 
 ```bash
-# Run with uv
+# Open the included example archive
 uv run python tools/z21lm_gui.py
 uv run python tools/z21lm_gui.py z21_new.z21
 
-# Run with default file (z21_new.z21)
-python tools/z21lm_gui.py
-
-# Run with specific file
-python tools/z21lm_gui.py z21_new.z21
-python tools/z21lm_gui.py rocoData.z21
+# Open another Z21 archive
+uv run python tools/z21lm_gui.py /path/to/rocoData.z21
 ```
 
-4. Use the command-line parser:
+Use the command-line parser:
 
 ```bash
 uv run z21lm --help
@@ -78,7 +115,8 @@ uv run z21lm read z21_new.z21
 uv run z21lm export z21_new.z21 output.json
 ```
 
-**GUI Features**:
+### GUI Features
+
 - Search locomotives by name or address
 - View detailed locomotive information
 - Browse function mappings with icons
@@ -140,7 +178,7 @@ AI suggestions are deliberately low-confidence and require manual selection.
 ## 📁 Project Structure
 
 ```
-z21_locomitive_manager/
+z21_locomotive_manager/
 ├── README.md                    # This file
 ├── pyproject.toml               # uv/Python project configuration
 ├── uv.lock                      # uv lockfile for reproducible installs
@@ -190,12 +228,27 @@ The CLI and GUI depend on the parser facade rather than ZIP or SQLite details.
 
 ## 🤝 Contributing
 
-Contributions are welcome! Areas for improvement:
+Contributions are welcome, especially improvements to Z21 format compatibility,
+platform support, OCR accuracy, DCC function matching, validation, and tests.
+
+1. Fork the repository and create a focused branch.
+2. Install the development environment with `uv sync`.
+3. Make the change and add or update tests.
+4. Run the test suite:
+
+   ```bash
+   uv run pytest tests
+   ```
+
+5. Open a pull request describing the problem, the implementation, and the
+   validation performed.
+
+Please avoid committing personal `.z21` archives, API keys, generated OCR data,
+or other private model-railway data.
 
 ## 📄 License
 
 This project is licensed under the BSD 3-Clause License.
 
-
-
-**Note**: This project is not affiliated with Roco or Z21. It is an independent tool for managing Z21 locomotive data files.
+**Note**: This project is not affiliated with Roco or Z21. It is an independent
+tool for managing Z21 locomotive data files.
