@@ -1,19 +1,42 @@
 # Z21 Locomotive Manager — Roco Z21 Editor, DCC Functions & OCR
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Swift 6](https://img.shields.io/badge/Swift-6-F05138?logo=swift&logoColor=white)](https://github.com/guotsuan/z21_locomotive_manager/tree/swift/macos-swift)
 [![macOS](https://img.shields.io/badge/macOS-Continuity%20Camera-000000?logo=apple&logoColor=white)](https://www.apple.com/macos/)
 [![License: BSD 3-Clause](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](#license)
 
-Z21 Locomotive Manager is an open-source, macOS-friendly Python desktop app and
-CLI for editing Roco Z21 locomotive databases. It manages `.z21` archives,
-individual `.z21loco` files, DCC F0–F32 function mappings and icons, and can
-extract locomotive details or function tables from manuals with OCR.
+Z21 Locomotive Manager is an open-source Roco Z21 editor with a native macOS
+SwiftUI application and a Python CustomTkinter app and CLI. It manages `.z21`
+archives, individual `.z21loco` files, DCC F0–F32 function mappings and icons,
+and can extract locomotive details or function tables from manuals with OCR.
 
 Use it to prepare model railway locomotives on a Mac, review every change before
 saving, and share completed locomotive files with the Z21 App through AirDrop.
 
+The native Swift implementation is maintained on the
+[`swift` branch](https://github.com/guotsuan/z21_locomotive_manager/tree/swift/macos-swift).
+The Python GUI, CLI, and reusable parser are maintained on `main`.
+
+## Screenshots
+
+### Native macOS app (SwiftUI)
+
+The SwiftUI interface provides a native macOS library sidebar, locomotive
+editor, system AirDrop sharing, Continuity Camera, keyboard navigation, and
+VoiceOver accessibility.
+
+![Native macOS SwiftUI Roco Z21 locomotive editor sharing a locomotive with AirDrop](docs/images/swiftui-macos-interface.png)
+
+### Python desktop app (CustomTkinter)
+
+The Python interface provides the original searchable locomotive browser,
+overview and function editors, OCR import tools, and AirDrop export workflow.
+
+![Python CustomTkinter Roco Z21 locomotive manager with the AirDrop export window](docs/images/python-customtkinter-interface.png)
+
 ## Contents
 
+- [Screenshots](#screenshots)
 - [Why use Z21 Locomotive Manager?](#why-use-z21-locomotive-manager)
 - [Features](#features)
 - [Supported files and workflows](#supported-files-and-workflows)
@@ -84,9 +107,9 @@ Typical uses include:
 | SQLite database | Read and update the `Loco.sqlite` data stored inside a Z21 archive. |
 | JSON | Export parsed locomotive data from the CLI for inspection or further processing. |
 
-The desktop interface and Continuity Camera integration target macOS. Core Z21
-parsing and CLI workflows are implemented in Python and can be used separately
-from the native camera features.
+The native SwiftUI app targets macOS 14 or newer. The Python desktop interface
+and Continuity Camera integration also target macOS, while the Python Z21 parser
+and CLI can be used separately from the native camera features.
 
 ## Quick Start
 
@@ -105,7 +128,7 @@ To inspect the command-line interface:
 uv run z21lm --help
 ```
 
-## System Requirements
+## Python Version System Requirements
 
 - Python 3.10 or higher
 - customtkinter>=5.0.0
